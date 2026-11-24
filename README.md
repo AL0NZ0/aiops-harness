@@ -340,7 +340,7 @@ node --check web/app.js
 npm run build            # 产出 dist/，供 Docker 镜像使用
 ```
 
-改动必须经过 ToolBroker，审批规则不能放宽；`config` 只做种子、`data` 是权威；新增敏感字段必须走 `api/src/secret-box.ts`。工程约束和目录规范见 [CLAUDE.md](CLAUDE.md)，开发交接和验收记录见 [PROGRESS.md](PROGRESS.md)。
+改动必须经过 ToolBroker，审批规则不能放宽；`config` 只做种子、`data` 是权威；新增敏感字段必须走 `api/src/secret-box.ts`。工程约束和目录规范见 [AGENTS.md](AGENTS.md)，开发与提交流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 目录
 
@@ -373,7 +373,6 @@ harness/                 只放 DSH 接入说明，不放引擎源码
 - [使用手册](docs/使用手册.md)：完整操作、接口、真实数据接入、部署和排查。
 - [K8s 部署说明](deploy/k8s/README.md)：Secret、Ingress、备份 CronJob、升级回滚。
 - [OpenAPI](docs/openapi.json)：对外 Agent API 契约。
-- [开发交接](PROGRESS.md)：已完成项、验收记录和断点。
 
 ## 许可证
 
