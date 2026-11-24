@@ -1,0 +1,79 @@
+# 手动恢复 Job 示例，不要放进 kustomization 自动 apply。
+# 使用前：scale deploy/aiops --replicas=0；把 --file 换成 aiops-backups 里实际的归档。
+# 归档文件和 data PVC 都会挂进来；旧 data 会复制到 /backups/data.bak.<时间戳>。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: aiops-restore
+  namespace: aiops
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: restore
+          image: mysql:8.4
+          command:
+            - /bin/bash
+            - /scripts/restore.sh
+            - --file
+            - /backups/aiops-YYYYmmdd-HHMMSS.tar.gz.enc
+            - --yes
+            - --no-start
+          env:
+            - name: RESTORE_MYSQL_MODE
+              value: host
+            - name: AIOPS_DATA_DIR
+              value: /app/data
+            - name: BACKUP_DIR
+              value: /backups
+            - name: AIOPS_DB_HOST
+              value: mysql
+            - name: AIOPS_DB_PORT
+              value: "3306"
+            - name: AIOPS_DB_USER
+              valueFrom:
+                secretKeyRef: { name: mysql-secrets, key: MYSQL_USER }
+            - name: AIOPS_DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: mysql-secrets, key: MYSQL_PASSWORD }
+            - name: AIOPS_DB_NAME
+              valueFrom:
+                secretKeyRef: { name: mysql-secrets, key: MYSQL_DATABASE }
+            - name: BACKUP_PASSPHRASE
+              valueFrom:
+                secretKeyRef: { name: aiops-secrets, key: BACKUP_PASSPHRASE }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+            - name: backups
+              mountPath: /backups
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: aiops-data
+        - name: backups
+          persistentVolumeClaim:
+            claimName: aiops-backups
+        - name: script
+          configMap:
+            name: aiops-backup-script
+            defaultMode: 0755
+        - name: tmp
+          emptyDir: {}

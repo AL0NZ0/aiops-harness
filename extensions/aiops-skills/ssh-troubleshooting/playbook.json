@@ -1,0 +1,7 @@
+{
+  "priority": 3,
+  "keywords": ["ssh", "主机", "登主机", "登录不上", "登录失败", "跳板机", "远程执行", "主机侧"],
+  "steps": [
+    { "tool": "knowledge.search", "args": { "query": "{{prompt}}", "top_k": 3 } }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "priority": 2,
+  "keywords": ["日志", "log", "es", "elasticsearch", "syslog", "报错", "检索", "错误日志"],
+  "steps": [
+    { "tool": "knowledge.search", "args": { "query": "{{prompt}}", "top_k": 3 } }
+  ]
+}

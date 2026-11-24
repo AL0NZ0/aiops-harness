@@ -1,0 +1,85 @@
+# 写权限 K8s MCP 单集群示例：复制整个目录就能再部署一个集群，不用 .env、不用脚本。
+#
+#   cp -r deploy/mcp-k8s-write /opt/aiops/mcp-k8s-cluster-a
+#   cd /opt/aiops/mcp-k8s-cluster-a
+#   mkdir -p kubeconfig
+#   cp ~/.kube/cluster-a.yaml kubeconfig/cluster.yaml
+#   chmod 600 kubeconfig/cluster.yaml
+#
+# 然后改 4 处，再 docker compose up -d：
+#   1. 下面的 user: 改成 id -u / id -g（要能读 0600 的 kubeconfig）
+#   2. 服务名 mcp-k8s-cluster-a 改成实际集群名（本文件 2 处）
+#   3. 服务名 mcp-k8s-cluster-a-auth 改成实际集群名（本文件 1 处，nginx.conf 里还有 1 处）
+#   4. nginx.conf 里的 Bearer token（openssl rand -hex 32 生成）
+#
+# 不写 container_name：容器名按目录名生成，复制多份不会冲突。
+# 只监听 aiops-net 内网，不发布宿主机端口；平台按服务名访问：
+#   http://mcp-k8s-cluster-a-auth:8766/mcp
+#
+# 这个实例不传 --disable-*，有写权限；平台调用写工具仍然必须审批。
+# 只读实例就在 command 里加 --disable-write --disable-delete --disable-kubectl。
+# 不要用集群管理员 kubeconfig，权限只给它确实需要变更的 namespace。
+
+services:
+  mcp-k8s-cluster-a:
+    image: ghcr.io/feiskyer/mcp-kubernetes-server:latest
+    restart: unless-stopped
+    # 与 kubeconfig 属主一致，改成 id -u / id -g 的实际值。
+    user: "1000:1000"
+    expose:
+      - "8766"
+    volumes:
+      - ./kubeconfig/cluster.yaml:/home/mcp/.kube/config:ro
+    environment:
+      KUBECONFIG: /home/mcp/.kube/config
+      HOME: /tmp
+      TZ: Asia/Shanghai
+    tmpfs:
+      - /tmp
+    command:
+      - --transport
+      - streamable-http
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8766"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(0 if s.connect_ex(('127.0.0.1',8766))==0 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - aiops
+
+  mcp-k8s-cluster-a-auth:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    expose:
+      - "8766"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      mcp-k8s-cluster-a:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8766"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - aiops
+
+networks:
+  aiops:
+    name: aiops-net
+    external: true

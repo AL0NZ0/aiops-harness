@@ -1,0 +1,44 @@
+{
+  "host": "127.0.0.1",
+  "port": 8787,
+  "internalToken": "dev-internal-token",
+  "actors": [
+    {
+      "id": "alice",
+      "name": "Alice",
+      "roles": [
+        "operator"
+      ]
+    },
+    {
+      "id": "bob",
+      "name": "Bob",
+      "roles": [
+        "approver"
+      ]
+    },
+    {
+      "id": "dana",
+      "name": "Dana",
+      "roles": [
+        "approver"
+      ]
+    },
+    {
+      "id": "carol",
+      "name": "Carol",
+      "roles": [
+        "viewer"
+      ]
+    }
+  ],
+  "knowledge": {
+    "provider": "local",
+    "root": "data/knowledge",
+    "seed": "extensions/knowledge/fixtures"
+  },
+  "assetsFile": "data/assets.json",
+  "credentialsFile": "data/credentials.json",
+  "mcpServersFile": "data/mcp-servers.json",
+  "skillsDir": "extensions/aiops-skills"
+}

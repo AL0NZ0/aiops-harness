@@ -1,0 +1,31 @@
+# 在 deploy/ 目录执行：kubectl apply -k deploy/
+# Secret 不在这里生成，先按 README 创建 aiops-secrets / mysql-secrets。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - k8s/namespace.yaml
+  - k8s/configmap.yaml
+  - k8s/pvc.yaml
+  - k8s/mysql.yaml
+  - k8s/deployment.yaml
+  - k8s/service.yaml
+  - k8s/ingress.yaml
+  - k8s/backup-cronjob.yaml
+
+# 备份脚本只保留 deploy/backup.sh 一份，生成 ConfigMap 挂进 CronJob。
+configMapGenerator:
+  - name: aiops-backup-script
+    namespace: aiops
+    files:
+      - backup.sh
+      - restore.sh
+    options:
+      disableNameSuffixHash: true
+
+# 替换镜像地址时用：kustomize edit set image aiops-harness=registry.example.com/aiops-harness:v2026.11.23-1
+# 也可以把 newTag 换成 digest: sha256:...；不要用 latest + IfNotPresent。
+images:
+  - name: aiops-harness
+    newName: aiops-harness
+    newTag: v0.1.0

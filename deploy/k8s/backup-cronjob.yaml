@@ -1,0 +1,87 @@
+# 每天 02:00 逻辑备份：mysqldump + data PVC，加密写到 aiops-backups。
+# 备份脚本由 kustomization 的 configMapGenerator 从 deploy/backup.sh 生成，避免两份副本。
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: aiops-backup
+  namespace: aiops
+spec:
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+          containers:
+            - name: backup
+              image: mysql:8.4
+              command: ["/bin/bash", "/scripts/backup.sh"]
+              env:
+                - name: BACKUP_MYSQL_MODE
+                  value: host
+                - name: AIOPS_DATA_DIR
+                  value: /app/data
+                - name: BACKUP_DIR
+                  value: /backups
+                - name: AIOPS_DB_HOST
+                  value: mysql
+                - name: AIOPS_DB_PORT
+                  value: "3306"
+                - name: AIOPS_DB_USER
+                  valueFrom:
+                    secretKeyRef: { name: mysql-secrets, key: MYSQL_USER }
+                - name: AIOPS_DB_PASSWORD
+                  valueFrom:
+                    secretKeyRef: { name: mysql-secrets, key: MYSQL_PASSWORD }
+                - name: AIOPS_DB_NAME
+                  valueFrom:
+                    secretKeyRef: { name: mysql-secrets, key: MYSQL_DATABASE }
+                - name: BACKUP_PASSPHRASE
+                  valueFrom:
+                    secretKeyRef: { name: aiops-secrets, key: BACKUP_PASSPHRASE }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+              volumeMounts:
+                - name: data
+                  mountPath: /app/data
+                  readOnly: true
+                - name: backups
+                  mountPath: /backups
+                - name: script
+                  mountPath: /scripts
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: aiops-data
+                readOnly: true
+            - name: backups
+              persistentVolumeClaim:
+                claimName: aiops-backups
+            - name: script
+              configMap:
+                name: aiops-backup-script
+                defaultMode: 0755
+            - name: tmp
+              emptyDir: {}

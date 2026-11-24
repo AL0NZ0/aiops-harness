@@ -1,0 +1,71 @@
+# 只读 K8s MCP 示例：复制整个目录就能换集群/换环境，不用 .env、不用脚本。
+#   cp -r deploy/mcp-k8s-read /opt/aiops/mcp-k8s-ro && cd /opt/aiops/mcp-k8s-ro
+#   mkdir -p kubeconfig && cp ~/.kube/aiops-ro.yaml kubeconfig/cluster.yaml && chmod 600 kubeconfig/cluster.yaml
+#   改 3 处：user: → id -u/id -g；nginx.conf 的 token；需要换集群名时改服务名（compose + nginx.conf）
+services:
+  mcp-k8s-read:
+    image: ghcr.io/feiskyer/mcp-kubernetes-server:latest
+    restart: unless-stopped
+    # 用宿主机 UID/GID 运行，kubeconfig 保持 0600 也能读；HOME 放 tmpfs 避免写只读目录。
+    user: "1000:1000"
+    expose:
+      - "8765"
+    volumes:
+      - ./kubeconfig/cluster.yaml:/home/mcp/.kube/config:ro
+    environment:
+      KUBECONFIG: /home/mcp/.kube/config
+      HOME: /tmp
+      TZ: Asia/Shanghai
+    tmpfs:
+      - /tmp
+    command:
+      - --transport
+      - streamable-http
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+      # 只读实例：禁写、禁删、禁 kubectl 裸命令。
+      - --disable-write
+      - --disable-delete
+      - --disable-kubectl
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(0 if s.connect_ex(('127.0.0.1',8765))==0 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - aiops
+
+  mcp-k8s-read-auth:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    expose:
+      - "8765"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      mcp-k8s-read:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8765"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - aiops
+
+networks:
+  aiops:
+    name: aiops-net
+    external: true

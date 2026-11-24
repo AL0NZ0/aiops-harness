@@ -1,0 +1,83 @@
+services:
+  aiops:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: aiops-harness:${AIOPS_VERSION:-latest}
+    container_name: aiops-harness
+    restart: unless-stopped
+    init: true
+    # 绑定挂载的 data/ 归宿主用户所有；容器用同一 UID/GID 才能读写 0600 文件。
+    # Linux/macOS 在 .env 里设置 AIOPS_UID=$(id -u)、AIOPS_GID=$(id -g)。
+    user: "${AIOPS_UID:?在 .env 设置 AIOPS_UID（id -u）}:${AIOPS_GID:?在 .env 设置 AIOPS_GID（id -g）}"
+    env_file:
+      - .env
+    environment:
+      # 容器内统一走 compose 网络；.env 里的本机 MySQL 地址只给宿主机开发用。
+      AIOPS_DB_HOST: mysql
+      AIOPS_DB_PORT: "3306"
+      AIOPS_HOST: 0.0.0.0
+      AIOPS_PORT: "8787"
+      # 容器里的 127.0.0.1 是容器自己；上游 MCP 在页面里按 host.docker.internal 或服务名添加。
+      AIOPS_CONFIG: /app/config/platform.json
+      AIOPS_WEB_ROOT: /app/web
+      AIOPS_OPENAPI_FILE: /app/docs/openapi.json
+      AIOPS_SECRET_KEY_FILE: /app/data/secret.key
+      TZ: Asia/Shanghai
+    ports:
+      # 默认只绑回环；局域网访问在 .env 里设置 AIOPS_BIND_ADDR=0.0.0.0。
+      - "${AIOPS_BIND_ADDR:-127.0.0.1}:${AIOPS_HTTP_PORT:-8787}:8787"
+    volumes:
+      # 运行数据（资产、凭证、MCP、通知、知识库、secret.key）必须持久化。
+      - ./data:/app/data
+    networks:
+      - default
+      # 和 deploy/mcp-* 各 MCP 目录共用；平台按服务名访问，不经过宿主机端口。
+      - aiops
+    depends_on:
+      mysql:
+        condition: service_healthy
+    # 兼容宿主机上单独发布的 MCP；默认部署用 aiops-net 里的服务名。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    stop_grace_period: 30s
+
+  mysql:
+    image: mysql:8.4
+    container_name: aiops-harness-mysql
+    restart: unless-stopped
+    ports:
+      # 只绑本机，方便宿主机排查；平台容器走 compose 内网，不经过这里。
+      - "127.0.0.1:${MYSQL_PORT:-3307}:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-aiops}
+      MYSQL_USER: ${MYSQL_USER:-aiops}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+      TZ: UTC
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    volumes:
+      - aiops-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  aiops-mysql-data:
+
+networks:
+  # 手工创建：docker network create aiops-net。平台和各 MCP 目录共用。
+  aiops:
+    name: aiops-net
+    external: true

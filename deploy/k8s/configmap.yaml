@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aiops-config
+  namespace: aiops
+data:
+  # 审批深链和告警回调基地址；改成浏览器/告警系统实际能访问的地址。
+  # 内网默认 HTTP，例如 http://10.0.0.10 或 http://aiops.internal；启用 TLS 再改 https。
+  AIOPS_PUBLIC_URL: "http://aiops.example.com"
+  # 账号模式从 MySQL 读用户；actors 只在 header 模式下使用。
+  # K8s 用 aiops-secrets 里的 AIOPS_INTERNAL_TOKEN 覆盖 internalToken；本地配置才需要填。
+  platform.json: |
+    {
+      "host": "0.0.0.0",
+      "port": 8787,
+      "internalToken": "",
+      "actors": [
+        { "id": "admin", "name": "Administrator", "roles": ["admin", "operator", "approver"] }
+      ],
+      "knowledge": {
+        "provider": "local",
+        "root": "data/knowledge",
+        "seed": "extensions/knowledge/fixtures"
+      },
+      "assetsFile": "data/assets.json",
+      "credentialsFile": "data/credentials.json",
+      "mcpServersFile": "data/mcp-servers.json",
+      "skillsDir": "extensions/aiops-skills"
+    }

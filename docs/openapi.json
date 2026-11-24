@@ -1,0 +1,526 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "AIOps Harness 对外 Agent API",
+    "version": "1.0.0",
+    "description": "外部 Agent（WorkBuddy、脚本等）创建任务、执行工具、查询事件和处理审批的 HTTP API。平台只记录任务和执行工具，不替外部 Agent 做推理。认证使用 API key：Authorization: Bearer aiops_...。"
+  },
+  "servers": [
+    { "url": "http://127.0.0.1:8787", "description": "本机默认地址" }
+  ],
+  "security": [{ "bearerAuth": [] }],
+  "components": {
+    "parameters": {
+      "TaskId": {
+        "name": "taskId",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string" }
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "未认证",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Forbidden": {
+        "description": "缺少 scope 或角色不允许",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "NotFound": {
+        "description": "对象不存在或当前身份不可见",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "API key。创建任务需要 tasks:write；工具调用需要 tools:execute；查事件需要 tasks:read；查审批需要 approvals:read。"
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": {
+              "code": { "type": "string" },
+              "message": { "type": "string" }
+            }
+          }
+        }
+      },
+      "Task": {
+        "type": "object",
+        "required": ["id", "sessionId", "ownerId", "title", "prompt", "skill", "status", "createdAt", "updatedAt"],
+        "properties": {
+          "id": { "type": "string", "example": "task_0123456789abcdef" },
+          "sessionId": { "type": "string", "example": "workbuddy-session-1" },
+          "ownerId": { "type": "string" },
+          "title": { "type": "string" },
+          "prompt": { "type": "string" },
+          "skill": { "type": "string", "example": "k8s-troubleshooting" },
+          "status": {
+            "type": "string",
+            "enum": ["queued", "running", "awaiting_approval", "succeeded", "failed", "cancelled"]
+          },
+          "origin": { "type": "string", "enum": ["web", "dsh", "api"] },
+          "result": { "type": "string" },
+          "error": { "type": "string" },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "updatedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "TaskEvent": {
+        "type": "object",
+        "required": ["id", "taskId", "type", "at"],
+        "properties": {
+          "id": { "type": "string" },
+          "taskId": { "type": "string" },
+          "type": {
+            "type": "string",
+            "example": "tool.result",
+            "description": "常见类型：task.started、skill.selected、tool.called、tool.result、approval.required、approval.decided、task.completed、task.failed、task.cancelled"
+          },
+          "at": { "type": "string", "format": "date-time" },
+          "data": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "Approval": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "taskId": { "type": "string" },
+          "ownerId": { "type": "string" },
+          "tool": { "type": "string" },
+          "args": { "type": "object", "additionalProperties": true },
+          "argsHash": { "type": "string" },
+          "status": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+          "requestedBy": { "type": "string" },
+          "requestedAt": { "type": "string", "format": "date-time" },
+          "decidedBy": { "type": "string" },
+          "decidedAt": { "type": "string", "format": "date-time" },
+          "comment": { "type": "string" },
+          "consumed": { "type": "boolean" }
+        }
+      },
+      "ToolOutcome": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["status", "result", "auditId"],
+            "properties": {
+              "status": { "const": "ok" },
+              "result": {},
+              "auditId": { "type": "string" }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["status", "approvalId", "auditId"],
+            "properties": {
+              "status": { "const": "awaiting_approval" },
+              "approvalId": { "type": "string" },
+              "auditId": { "type": "string" }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["status", "reason", "auditId"],
+            "properties": {
+              "status": { "const": "denied" },
+              "reason": { "type": "string" },
+              "auditId": { "type": "string" }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["status", "error", "auditId"],
+            "properties": {
+              "status": { "const": "error" },
+              "error": { "type": "string" },
+              "auditId": { "type": "string" }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "paths": {
+    "/api/v1/tasks": {
+      "post": {
+        "summary": "创建外部 Agent 任务",
+        "description": "任务由调用方自己驱动；平台不会启动模型循环。变更工具会进入审批。创建后建议把任务 id 和 sessionId 一起保存。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["prompt"],
+                "properties": {
+                  "prompt": { "type": "string" },
+                  "title": { "type": "string" },
+                  "skill": { "type": "string", "description": "可选。不传时平台按关键词选择。" },
+                  "sessionId": { "type": "string", "description": "可选。外部 Agent 的会话标识。" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "任务已创建",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["task"],
+                  "properties": { "task": { "$ref": "#/components/schemas/Task" } }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      },
+      "get": {
+        "summary": "列出任务",
+        "parameters": [
+          { "name": "status", "in": "query", "schema": { "type": "string" } },
+          { "name": "origin", "in": "query", "schema": { "type": "string", "enum": ["api", "dsh", "web", "all"], "default": "api" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0, "default": 0 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "任务列表",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tasks": { "type": "array", "items": { "$ref": "#/components/schemas/Task" } },
+                    "total": { "type": "integer" },
+                    "limit": { "type": ["integer", "null"] },
+                    "offset": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{taskId}": {
+      "get": {
+        "summary": "读取任务状态和结论",
+        "parameters": [{ "$ref": "#/components/parameters/TaskId" }],
+        "responses": {
+          "200": {
+            "description": "任务详情",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "task": { "$ref": "#/components/schemas/Task" } }
+                }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/v1/tasks/{taskId}/events": {
+      "get": {
+        "summary": "读取任务过程事件",
+        "parameters": [
+          { "$ref": "#/components/parameters/TaskId" },
+          { "name": "after", "in": "query", "schema": { "type": "string" }, "description": "只返回该事件之后的事件" },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200 }, "description": "取最近 N 条" },
+          { "name": "stream", "in": "query", "schema": { "type": "string", "enum": ["1"] }, "description": "SSE 流，最多 60 秒" }
+        ],
+        "responses": {
+          "200": {
+            "description": "事件列表或 text/event-stream",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "events": { "type": "array", "items": { "$ref": "#/components/schemas/TaskEvent" } },
+                    "total": { "type": "integer" },
+                    "limit": { "type": ["integer", "null"] }
+                  }
+                }
+              },
+              "text/event-stream": { "schema": { "type": "string" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{taskId}/tool-calls": {
+      "post": {
+        "summary": "在任务下执行工具",
+        "description": "只读工具直接执行；变更工具返回 status=awaiting_approval 和 approvalId，不会执行。批准后平台自动执行一次，调用方用 /api/v1/approvals/{approvalId} 取结果，不要重复调用同一个变更。",
+        "parameters": [{ "$ref": "#/components/parameters/TaskId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["tool"],
+                "properties": {
+                  "tool": { "type": "string", "example": "mcp.k8s.k8s_get" },
+                  "args": { "type": "object", "additionalProperties": true },
+                  "approvalId": { "type": "string", "description": "审批通过后重试时使用；正常调用不要传。" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "工具结果",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "outcome": { "$ref": "#/components/schemas/ToolOutcome" } }
+                }
+              }
+            }
+          },
+          "409": { "description": "任务已结束或正在等待审批" }
+        }
+      }
+    },
+    "/api/v1/tasks/{taskId}/finish": {
+      "post": {
+        "summary": "结束外部 Agent 任务",
+        "parameters": [{ "$ref": "#/components/parameters/TaskId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "status": { "type": "string", "enum": ["succeeded", "failed"], "default": "succeeded" },
+                  "result": { "type": "string" },
+                  "error": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "任务已结束",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "task": { "$ref": "#/components/schemas/Task" } }
+                }
+              }
+            }
+          },
+          "409": { "description": "还有挂起审批或任务已结束" }
+        }
+      }
+    },
+    "/api/v1/tasks/{taskId}/cancel": {
+      "post": {
+        "summary": "取消任务并作废挂起审批；有挂起审批时必须传 force=true",
+        "parameters": [{ "$ref": "#/components/parameters/TaskId" }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "force": {
+                    "type": "boolean",
+                    "description": "任务还有待审批变更时必须为 true，否则返回 409"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "任务已取消",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "task": { "$ref": "#/components/schemas/Task" } }
+                }
+              }
+            }
+          },
+          "409": { "description": "任务还有挂起审批，未传 force" }
+        }
+      }
+    },
+    "/api/v1/tasks/{taskId}/audit": {
+      "get": {
+        "summary": "读取任务审计记录",
+        "parameters": [
+          { "$ref": "#/components/parameters/TaskId" },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "审计记录",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "audit": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+                    "total": { "type": "integer" },
+                    "limit": { "type": ["integer", "null"] }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{taskId}/audit/export": {
+      "get": {
+        "summary": "导出任务审计记录（CSV 或 JSON）",
+        "parameters": [
+          { "$ref": "#/components/parameters/TaskId" },
+          { "name": "format", "in": "query", "schema": { "type": "string", "enum": ["csv", "json"], "default": "csv" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "审计导出文件",
+            "content": {
+              "text/csv": { "schema": { "type": "string" } },
+              "application/json": { "schema": { "type": "object", "additionalProperties": true } }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/approvals": {
+      "get": {
+        "summary": "列出审批",
+        "parameters": [
+          { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["pending", "approved", "rejected"] } },
+          { "name": "taskId", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "审批列表",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "approvals": { "type": "array", "items": { "$ref": "#/components/schemas/Approval" } },
+                    "total": { "type": "integer" },
+                    "limit": { "type": ["integer", "null"] },
+                    "offset": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/approvals/{approvalId}": {
+      "get": {
+        "summary": "读取审批和执行结果",
+        "description": "execution.status 为 succeeded/failed/unknown 时，取 execution.result 或 execution.error。审批被拒绝时 status 为 rejected。",
+        "parameters": [
+          { "name": "approvalId", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "审批详情",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "approval": { "$ref": "#/components/schemas/Approval" },
+                    "execution": {
+                      "type": "object",
+                      "properties": {
+                        "status": { "type": "string", "enum": ["pending", "approved", "rejected", "succeeded", "failed", "unknown"] },
+                        "at": { "type": "string", "format": "date-time" },
+                        "result": {},
+                        "error": { "type": "string" },
+                        "auditId": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/v1/tools": {
+      "get": {
+        "summary": "列出可用工具和风险等级",
+        "responses": {
+          "200": {
+            "description": "工具列表",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tools": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/skills": {
+      "get": {
+        "summary": "列出技能",
+        "responses": {
+          "200": {
+            "description": "技能列表",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "skills": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

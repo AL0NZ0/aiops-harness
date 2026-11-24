@@ -1,0 +1,7 @@
+{
+  "priority": 3,
+  "keywords": ["crashloop", "pod", "启动失败", "无响应", "排查", "k8s", "kubernetes", "pending", "oomkilled", "节点", "重启", "未就绪", "imagepullbackoff", "调度", "故障", "诊断"],
+  "steps": [
+    { "tool": "knowledge.search", "args": { "query": "{{prompt}}", "top_k": 3 } }
+  ]
+}

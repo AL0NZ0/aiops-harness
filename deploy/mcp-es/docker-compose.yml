@@ -1,0 +1,55 @@
+# Elasticsearch MCP 示例：复制目录、改 ES 地址/账号和 token 就能再部署一套。
+#   cp -r deploy/mcp-es /opt/aiops/mcp-es && cd /opt/aiops/mcp-es
+#   改 docker-compose.yml 的 ES_URL / ES_USERNAME / ES_PASSWORD，改 nginx.conf 的 token
+# 文件里有 ES 密码，不要再提交回仓库，建议 chmod 600 docker-compose.yml。
+services:
+  mcp-es:
+    image: docker.elastic.co/mcp/elasticsearch:latest
+    restart: unless-stopped
+    command: ["http", "--address", "0.0.0.0:8080"]
+    expose:
+      - "8080"
+    environment:
+      # 改这里：ES 地址、账号和密码。
+      ES_URL: http://host.docker.internal:9200
+      ES_USERNAME: elastic
+      ES_PASSWORD: CHANGE_ME_ES_PASSWORD
+      TZ: Asia/Shanghai
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -tln | grep -q ':8080'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - aiops
+
+  mcp-es-auth:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    expose:
+      - "8080"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      mcp-es:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8080"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - aiops
+
+networks:
+  aiops:
+    name: aiops-net
+    external: true

@@ -1,0 +1,61 @@
+# VictoriaMetrics MCP 示例：复制目录、改数据源地址和 token 就能再部署一套。
+#   cp -r deploy/mcp-vm /opt/aiops/mcp-vm && cd /opt/aiops/mcp-vm
+#   改 docker-compose.yml 的 VM_INSTANCE_ENTRYPOINT，改 nginx.conf 的 token
+services:
+  mcp-vm:
+    image: ghcr.io/victoriametrics/mcp-victoriametrics:latest
+    restart: unless-stopped
+    expose:
+      - "8080"
+    environment:
+      # 改这里：single 实例填 http://<host>:8428；集群版填对应 select 地址。
+      VM_INSTANCE_ENTRYPOINT: http://host.docker.internal:8428
+      VM_INSTANCE_TYPE: single
+      MCP_SERVER_MODE: http
+      MCP_LISTEN_ADDR: 0.0.0.0:8080
+      MCP_LOG_LEVEL: info
+      TZ: Asia/Shanghai
+    # 数据源跑在宿主机上时需要；远端地址不受影响。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - --spider
+        - http://127.0.0.1:8080/health/liveness
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - aiops
+
+  mcp-vm-auth:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    expose:
+      - "8080"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      mcp-vm:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8080"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - aiops
+
+networks:
+  aiops:
+    name: aiops-net
+    external: true

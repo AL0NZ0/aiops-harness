@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiops
+  namespace: aiops
+spec:
+  # 清单固定单副本：RWO PVC 不能多挂，任务 runner 和 /mcp 会话也不跨实例。
+  # 多副本需共享存储 + AIOPS_INSTANCE_ID + 粘性会话。
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: aiops
+  template:
+    metadata:
+      labels:
+        app: aiops
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: aiops
+          # 推到集群能拉的仓库后替换成实际地址；用不可变 tag 或 digest，不要用 latest。
+          image: aiops-harness:v0.1.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: aiops-secrets
+          env:
+            - name: AIOPS_CONFIG
+              value: /app/config/platform.json
+            - name: AIOPS_HOST
+              value: 0.0.0.0
+            - name: AIOPS_PORT
+              value: "8787"
+            - name: AIOPS_AUTH
+              value: local
+            # 内网 HTTP 必须为 0；如果改成 HTTPS（Ingress TLS 或平台 TLS）再设为 1。
+            - name: AIOPS_COOKIE_SECURE
+              value: "0"
+            # 平台只通过 Ingress 暴露；信任 Ingress 追加的最右侧 XFF，限速和安全事件才拿得到真实客户端 IP。
+            # 如果 Service 也会被集群内其他 Pod 直接访问，恶意 Pod 仍可伪造该头，需配合网络策略或去掉这个开关。
+            - name: AIOPS_TRUST_PROXY
+              value: "1"
+            - name: AIOPS_PUBLIC_URL
+              valueFrom:
+                configMapKeyRef: { name: aiops-config, key: AIOPS_PUBLIC_URL }
+            - name: AIOPS_DB_HOST
+              value: mysql
+            - name: AIOPS_DB_PORT
+              value: "3306"
+            - name: AIOPS_DB_NAME
+              valueFrom:
+                secretKeyRef: { name: mysql-secrets, key: MYSQL_DATABASE }
+            - name: AIOPS_DB_USER
+              valueFrom:
+                secretKeyRef: { name: mysql-secrets, key: MYSQL_USER }
+            - name: AIOPS_DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: mysql-secrets, key: MYSQL_PASSWORD }
+            - name: AIOPS_DB_CONNECT_TIMEOUT_MS
+              value: "60000"
+          ports:
+            - name: http
+              containerPort: 8787
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+            - name: config
+              mountPath: /app/config/platform.json
+              subPath: platform.json
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: aiops-data
+        - name: config
+          configMap:
+            name: aiops-config
+        - name: tmp
+          emptyDir: {}

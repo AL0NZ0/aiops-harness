@@ -1,0 +1,7 @@
+{
+  "priority": 1,
+  "keywords": ["cpu", "飙高", "throttling", "限流", "容量", "水位", "监控", "指标", "prometheus", "vm", "内存", "磁盘", "网络", "告警"],
+  "steps": [
+    { "tool": "knowledge.search", "args": { "query": "{{prompt}}", "top_k": 3 } }
+  ]
+}

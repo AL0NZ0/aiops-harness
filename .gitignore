@@ -1,0 +1,15 @@
+node_modules/
+dist/
+data/
+data.bak.*
+backups/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+docker-compose.override.yml
+deploy/k8s/secret.yaml
+# 写权限 MCP 模板里就地放的 kubeconfig 不进仓库（真实 token 也别写回模板目录）
+deploy/mcp-k8s-write/kubeconfig/
+session-summary-*.md

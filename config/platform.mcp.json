@@ -1,0 +1,67 @@
+{
+  "host": "127.0.0.1",
+  "port": 8787,
+  "internalToken": "dev-internal-token",
+  "actors": [
+    {
+      "id": "alice",
+      "name": "Alice",
+      "roles": [
+        "operator"
+      ]
+    },
+    {
+      "id": "bob",
+      "name": "Bob",
+      "roles": [
+        "approver"
+      ]
+    },
+    {
+      "id": "dana",
+      "name": "Dana",
+      "roles": [
+        "approver"
+      ]
+    },
+    {
+      "id": "carol",
+      "name": "Carol",
+      "roles": [
+        "viewer"
+      ]
+    }
+  ],
+  "knowledge": {
+    "provider": "local",
+    "root": "data/knowledge",
+    "seed": "extensions/knowledge/fixtures"
+  },
+  "assetsFile": "data/assets.json",
+  "credentialsFile": "data/credentials.json",
+  "mcpServersFile": "data/mcp-servers.json",
+  "skillsDir": "extensions/aiops-skills",
+  "mcpServers": [
+    {
+      "name": "k8s",
+      "system": "kubernetes",
+      "url": "http://127.0.0.1:8765/mcp",
+      "readOnly": true,
+      "mutateTools": [
+        "helm"
+      ]
+    },
+    {
+      "name": "vm",
+      "system": "prometheus",
+      "url": "http://127.0.0.1:8081/mcp",
+      "readOnly": true
+    },
+    {
+      "name": "es",
+      "system": "elasticsearch",
+      "url": "http://127.0.0.1:8082/mcp",
+      "readOnly": true
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+# 只暴露平台；MCP 和 MySQL 不建 Ingress。远程 DSH 也通过同一个入口访问 /mcp，
+# 仍然需要 API key，scope 至少 tools:execute。
+#
+# 内网默认 HTTP，不绑定 host，IP 或域名都能访问。
+# 需要限制域名时给 rules 加 host；需要 HTTPS 时恢复 tls 段，并把
+# deployment.yaml 的 AIOPS_COOKIE_SECURE 改成 1。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: aiops
+  namespace: aiops
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "2m"
+    # /mcp 是长连接 JSON-RPC，按需放宽超时。
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: aiops
+                port:
+                  name: http
