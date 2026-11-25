@@ -42,6 +42,8 @@ async function boot(options: {
   models?: ModelRegistry
   instanceId?: string
   approvalPollMs?: number
+  allowAdminSelfApproval?: boolean
+  securityEvent?: (type: string, detail: Record<string, unknown>) => void
 } = {}) {
   const world = {
     pods: [
@@ -130,6 +132,8 @@ async function boot(options: {
     ...(options.modelResolver ? { modelResolver: options.modelResolver } : {}),
     ...(options.instanceId ? { instanceId: options.instanceId } : {}),
     ...(options.approvalPollMs !== undefined ? { approvalPollMs: options.approvalPollMs } : {}),
+    ...(options.allowAdminSelfApproval !== undefined ? { allowAdminSelfApproval: options.allowAdminSelfApproval } : {}),
+    ...(options.securityEvent ? { securityEvent: options.securityEvent } : {}),
   })
   const server = createServer(platform, {
     internalToken: 'test-token',
@@ -1528,6 +1532,129 @@ test('审批人能看到有审批记录的任务，admin 也不能自批', async
     assert.equal(self.status, 403)
   } finally {
     await second.close()
+  }
+})
+
+test('显式开启后 admin 可以自批，approver 仍然不行，执行只能一次', async () => {
+  const ctx = await boot({ allowAdminSelfApproval: true })
+  try {
+    assert.equal(ctx.platform.adminSelfApprovalAllowed, true)
+    // approver 自己名下的任务即使在开关开启时也不能自批。
+    const bobTask = await api(ctx.base, 'bob', 'POST', '/api/tasks', { prompt: '请重启 checkout-api' })
+    const bobTaskId = bobTask.body.task.id as string
+    await ctx.platform.waitUntil(bobTaskId, (item) => item.status === 'awaiting_approval')
+    const bobPending = await api(ctx.base, 'bob', 'GET', '/api/approvals?status=pending')
+    const bobApproval = bobPending.body.approvals.find((item: Approval) => item.taskId === bobTaskId)
+    assert.ok(bobApproval)
+    const bobSelf = await api(ctx.base, 'bob', 'POST', `/api/approvals/${bobApproval.id}`, { decision: 'approved' })
+    assert.equal(bobSelf.status, 403)
+    const approvedByDana = await api(ctx.base, 'dana', 'POST', `/api/approvals/${bobApproval.id}`, { decision: 'approved' })
+    assert.equal(approvedByDana.status, 200)
+    await ctx.platform.waitUntil(bobTaskId, (item) => item.status === 'succeeded')
+
+    // admin 自己发起的变更可以自己批，执行一次后审批不能再消费。
+    const own = await api(ctx.base, 'root', 'POST', '/api/tasks', { prompt: '请重启 checkout-api' })
+    const ownTaskId = own.body.task.id as string
+    await ctx.platform.waitUntil(ownTaskId, (item) => item.status === 'awaiting_approval')
+    const ownPending = await api(ctx.base, 'root', 'GET', '/api/approvals?status=pending')
+    const ownApproval = ownPending.body.approvals.find((item: Approval) => item.taskId === ownTaskId)
+    assert.ok(ownApproval)
+    const pod = ctx.world.pods.find((item) => item.workload === 'checkout-api')
+    const before = pod?.restarts ?? 0
+    const self = await api(ctx.base, 'root', 'POST', `/api/approvals/${ownApproval.id}`, { decision: 'approved', comment: '单人值守窗口' })
+    assert.equal(self.status, 200)
+    await ctx.platform.waitUntil(ownTaskId, (item) => item.status === 'succeeded')
+    assert.equal(pod?.restarts, before + 1)
+    const events = await api(ctx.base, 'root', 'GET', `/api/tasks/${ownTaskId}/events`)
+    const decided = events.body.events.find((event: { type: string; data?: { selfApproved?: boolean } }) => event.type === 'approval.decided')
+    assert.equal(decided?.data?.selfApproved, true)
+    const again = await api(ctx.base, 'root', 'POST', `/api/tool-calls`, {
+      tool: 'demo.restart',
+      args: { namespace: 'shop', name: 'checkout-api' },
+      taskId: ownTaskId,
+      approvalId: ownApproval.id,
+    }, { 'x-internal-token': 'test-token' })
+    assert.equal(again.status, 409)
+    assert.equal(pod?.restarts, before + 1)
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('失败的平台任务可以重试，外部任务和未失败任务不行', async () => {
+  let failures = 2
+  const model: ChatModel = {
+    async complete() {
+      if (failures > 0) {
+        failures -= 1
+        throw new Error('模型暂不可用')
+      }
+      return { content: '重试后排查完成', toolCalls: [] }
+    },
+  }
+  const seen: Array<{ type: string; detail: Record<string, unknown> }> = []
+  const ctx = await boot({ model, securityEvent: (type, detail) => seen.push({ type, detail }) })
+  try {
+    const created = await api(ctx.base, 'alice', 'POST', '/api/tasks', { prompt: '排查 checkout-api CrashLoopBackOff' })
+    const failed = await ctx.platform.waitUntil(created.body.task.id, (item) => item.status === 'failed')
+    assert.match(failed.error ?? '', /模型暂不可用/)
+
+    // owner 重试仍然失败（第二次模型调用也失败），事件记录操作者和原 owner。
+    const firstRetry = await api(ctx.base, 'alice', 'POST', `/api/tasks/${failed.id}/retry`)
+    assert.equal(firstRetry.status, 201)
+    assert.notEqual(firstRetry.body.task.id, failed.id)
+    assert.equal(firstRetry.body.task.origin, 'web')
+    assert.equal(firstRetry.body.task.prompt, failed.prompt)
+    assert.equal(firstRetry.body.task.skill, failed.skill)
+    const secondFailed = await ctx.platform.waitUntil(firstRetry.body.task.id, (item) => item.status === 'failed')
+    const firstEvents = (await api(ctx.base, 'alice', 'GET', `/api/tasks/${secondFailed.id}/events`)).body.events
+    const firstMarker = firstEvents.find((event: { type: string }) => event.type === 'task.retried')
+    assert.equal(firstMarker.data.fromTaskId, failed.id)
+    assert.equal(firstMarker.data.actorId, 'alice')
+    assert.equal(firstMarker.data.fromOwnerId, 'alice')
+    assert.equal(firstMarker.data.fromRejectedApproval, undefined)
+
+    // admin 可以代重试别人的失败任务；新任务归 admin，事件保留原 owner。
+    const rootRetry = await api(ctx.base, 'root', 'POST', `/api/tasks/${secondFailed.id}/retry`)
+    assert.equal(rootRetry.status, 201)
+    assert.equal(rootRetry.body.task.ownerId, 'root')
+    const succeeded = await ctx.platform.waitUntil(rootRetry.body.task.id, (item) => item.status === 'succeeded')
+    assert.match(succeeded.result ?? '', /重试后排查完成/)
+    const rootEvents = (await api(ctx.base, 'root', 'GET', `/api/tasks/${succeeded.id}/events`)).body.events
+    const rootMarker = rootEvents.find((event: { type: string }) => event.type === 'task.retried')
+    assert.equal(rootMarker.data.actorId, 'root')
+    assert.equal(rootMarker.data.fromOwnerId, 'alice')
+    // 原任务保持失败，不被重试改写。
+    const original = await api(ctx.base, 'alice', 'GET', `/api/tasks/${failed.id}`)
+    assert.equal(original.body.task.status, 'failed')
+
+    // 安全事件记录重试动作，只含任务号和身份，不含 prompt。
+    assert.equal(seen.length, 2)
+    assert.ok(seen.every((item) => item.type === 'task.retried'))
+    assert.equal(seen[1].detail.userId, 'root')
+    assert.equal(seen[1].detail.fromTaskId, secondFailed.id)
+    assert.equal(seen[1].detail.fromOwnerId, 'alice')
+    assert.doesNotMatch(JSON.stringify(seen), /CrashLoopBackOff/)
+
+    // 只有 failed 能重试；alice 看不到 root 的任务，用 root 验证 409。
+    const again = await api(ctx.base, 'root', 'POST', `/api/tasks/${succeeded.id}/retry`)
+    assert.equal(again.status, 409)
+
+    // 外部 Agent 任务由调用方自己重试，平台拒绝代跑。
+    const agent = await api(ctx.base, 'alice', 'POST', '/api/agent/tasks', {
+      prompt: 'DSH 任务',
+      sessionId: 'sess-retry',
+    }, { 'x-internal-token': 'test-token' })
+    const agentId = agent.body.task.id as string
+    await api(ctx.base, 'alice', 'POST', `/api/agent/tasks/${agentId}/finish`, {
+      status: 'failed',
+      error: '外部结束',
+    }, { 'x-internal-token': 'test-token' })
+    const externalRetry = await api(ctx.base, 'alice', 'POST', `/api/tasks/${agentId}/retry`)
+    assert.equal(externalRetry.status, 409)
+    assert.match(externalRetry.body.error.message, /平台网页任务/)
+  } finally {
+    await ctx.close()
   }
 })
 

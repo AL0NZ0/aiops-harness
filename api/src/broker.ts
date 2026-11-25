@@ -23,6 +23,8 @@ export class ToolBroker {
     tools: Tool[],
     private readonly store: Store,
     actors: Actor[],
+    /** 仅当平台显式开启 AIOPS_ALLOW_ADMIN_SELF_APPROVAL 时，admin 自批的审批才允许执行。 */
+    private readonly allowAdminSelfApproval = false,
   ) {
     this.tools = new Map(tools.map((tool) => [tool.name, tool]))
     this.actors = new Map(actors.map((actor) => [actor.id, actor]))
@@ -98,7 +100,10 @@ export class ToolBroker {
     if (approval.taskId !== input.taskId) return '审批不属于这个任务'
     if (approval.tool !== input.tool || approval.argsHash !== canonical(input.args)) return '审批与本次调用不一致'
     if (approval.status !== 'approved') return '审批尚未通过'
-    if (!approval.decidedBy || approval.decidedBy === approval.ownerId) return '变更不能由任务所有者自己放行'
+    if (!approval.decidedBy) return '变更不能由任务所有者自己放行'
+    if (approval.decidedBy === approval.ownerId && !this.allowAdminSelfApproval) {
+      return '变更不能由任务所有者自己放行'
+    }
     if (approval.consumed) return '审批已使用'
     return undefined
   }

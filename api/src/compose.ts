@@ -156,6 +156,13 @@ export async function compose(
       .recordConfigEvent(`config.${action}`, { source: 'mcp-health', ...detail })
       .catch((error) => log.warn('后台状态审计写入失败', { action, error }))
   }
+  // 任务级特权操作（如 admin 代重试）写入 security_events；detail 只放任务号和身份，不放 prompt。
+  const securityEvent = (type: string, detail: Record<string, unknown>) => {
+    if (!auth.service) return
+    void auth.service
+      .recordConfigEvent(type, detail)
+      .catch((error) => log.warn('任务安全事件写入失败', { type, error }))
+  }
   // 告警结果只推回接入源显式选中的通知渠道；由 Platform 记录投递结果，失败不影响任务结果。
   const notifyTargets = (webhookIds: string[], event: NotificationEvent) =>
     notifier.sendTo(webhookIds, event)
@@ -163,6 +170,8 @@ export async function compose(
   // 多实例部署时每个副本设置唯一值（K8s 可用 POD_NAME），启动回收只处理本实例的任务。
   const instanceId = process.env.AIOPS_INSTANCE_ID?.trim() || undefined
   const approvalPollMs = Number(process.env.AIOPS_APPROVAL_POLL_MS ?? 2000)
+  // 默认禁止自批；只有显式设置 AIOPS_ALLOW_ADMIN_SELF_APPROVAL=1 才允许 admin 自批。
+  const allowAdminSelfApproval = process.env.AIOPS_ALLOW_ADMIN_SELF_APPROVAL === '1'
   const platform = new Platform({
     actors: auth.actors,
     skills,
@@ -183,11 +192,13 @@ export async function compose(
     ...(Number.isFinite(approvalTtlMs) ? { approvalTtlMs } : {}),
     ...(instanceId ? { instanceId } : {}),
     ...(Number.isFinite(approvalPollMs) ? { approvalPollMs } : {}),
+    allowAdminSelfApproval,
     ...(process.env.AIOPS_MODEL_DISABLE === '1' ? {} : { modelResolver: models }),
     ...(agentLimits.maxSteps !== undefined ? { agentMaxSteps: agentLimits.maxSteps } : {}),
     ...(agentLimits.toolOutputChars !== undefined ? { agentToolOutputChars: agentLimits.toolOutputChars } : {}),
     notify,
     audit,
+    securityEvent,
   })
   await platform.loadToolPolicies()
   await platform.recoverInterruptedTasks()

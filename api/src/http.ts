@@ -365,6 +365,7 @@ async function me(ctx: Ctx): Promise<void> {
   sendJson(ctx.res, 200, {
     user: toPublicUser(ctx.auth.user),
     method: ctx.auth.method,
+    allowAdminSelfApproval: ctx.platform.adminSelfApprovalAllowed,
     ...(ctx.auth.session ? { csrfToken: ctx.auth.session.csrfToken } : {}),
     ...(ctx.auth.apiKey ? { scopes: ctx.auth.apiKey.scopes } : {}),
   })
@@ -894,6 +895,7 @@ function match(method: string, pathname: string): { params: Record<string, strin
     { method: 'GET', pattern: /^\/api\/tasks\/([^/]+)\/events$/, handle: events },
     { method: 'GET', pattern: /^\/api\/tasks\/([^/]+)\/audit$/, handle: audit },
     { method: 'GET', pattern: /^\/api\/tasks\/([^/]+)\/audit\/export$/, handle: exportTaskAudit },
+    { method: 'POST', pattern: /^\/api\/tasks\/([^/]+)\/retry$/, handle: retryTask },
     { method: 'POST', pattern: /^\/api\/tasks\/([^/]+)\/cancel$/, handle: cancel },
     { method: 'POST', pattern: /^\/api\/tasks\/([^/]+)\/finish$/, handle: finishTask },
     { method: 'POST', pattern: /^\/api\/agent\/tasks\/([^/]+)\/finish$/, handle: finishAgentTask },
@@ -967,6 +969,11 @@ async function createTask(ctx: Ctx): Promise<void> {
     provider: stringField(body, 'provider'),
     model: stringField(body, 'model'),
   })
+  sendJson(ctx.res, 201, { task })
+}
+
+async function retryTask(ctx: Ctx): Promise<void> {
+  const task = await ctx.platform.retryTask(ctx.actorId, ctx.params.id ?? '')
   sendJson(ctx.res, 201, { task })
 }
 

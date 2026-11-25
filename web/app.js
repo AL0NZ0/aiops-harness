@@ -23,6 +23,7 @@ const EVENTS = {
   'task.completed': '任务完成',
   'task.failed': '任务失败',
   'task.cancelled': '任务取消',
+  'task.retried': '任务重试',
   'alert.notify': '告警结果通知',
 }
 
@@ -147,6 +148,7 @@ const state = {
   authMethod: '',
   csrfToken: '',
   me: null,
+  allowAdminSelfApproval: false,
   users: [],
   loginLocks: [],
   keys: [],
@@ -205,22 +207,26 @@ const state = {
   mcpErrors: [],
   mcpHealth: [],
   mcpNotice: '',
+  mcpNoticeTone: '',
   mcpEditorOpen: false,
   modelProviders: [],
   modelProvidersLoaded: false,
   modelEditing: '',
   modelFormOpen: false,
   modelNotice: '',
+  modelNoticeTone: '',
   notifications: { settings: { enabled: true, minIntervalMs: 60000 }, webhooks: [], types: [] },
   notificationsLoaded: false,
   notificationEditing: '',
   notificationFormOpen: false,
   notificationNotice: '',
+  notificationNoticeTone: '',
   alertSources: [],
   alertSourcesLoaded: false,
   alertSourceEditing: '',
   alertSourceFormOpen: false,
   alertSourceNotice: '',
+  alertSourceNoticeTone: '',
   alertSourceToken: '',
   alertSourcePath: '',
   errorSource: '',
@@ -411,7 +417,7 @@ const ROLE_INFO = {
   operator: '运维：提交任务、执行只读工具；变更走审批；只看自己发起的任务。通常只配 API key，不登录网页。',
   approver: '审批：运维全部能力，并能审批别人名下的变更；看自己发起的和有审批记录的任务。必须设置密码。',
   auditor: '审计：只读查看全平台任务、事件、审批和审计记录；不能执行工具、不能审批、不能管理用户。必须设置密码。',
-  admin: '管理员：全部权限，含用户、API key 和 MCP 管理；不能审批自己名下的变更。必须设置密码。',
+  admin: '管理员：全部权限，含用户、API key 和 MCP 管理；默认不能审批自己名下的变更，只有平台显式开启 AIOPS_ALLOW_ADMIN_SELF_APPROVAL 后才可自批。必须设置密码。',
 }
 
 function roleLabel(roles) {
@@ -448,14 +454,25 @@ function canSubmit(person) {
 }
 
 function canApprove(person, approval) {
-  if (!person) return false
+  if (!person || approval.status !== 'pending') return false
   const approver = person.roles.includes('approver') || person.roles.includes('admin')
-  return approver && person.id !== approval.ownerId && approval.status === 'pending'
+  if (person.id !== approval.ownerId) return approver
+  // 自己名下的变更默认不能批；只有平台开启开关后 admin 才放行。
+  return state.allowAdminSelfApproval === true && person.roles.includes('admin')
 }
 
 function canResume(person, approval) {
   if (!person || approval.status !== 'approved' || approval.consumed) return false
   return person.id === approval.ownerId || person.roles.includes('approver') || person.roles.includes('admin')
+}
+
+function canRetry(person, task) {
+  if (!person || !task || task.status !== 'failed') return false
+  const origin = task.origin || 'web'
+  if (origin !== 'web') return false
+  const operator = person.roles.includes('operator') || person.roles.includes('approver') || person.roles.includes('admin')
+  if (!operator) return false
+  return task.ownerId === person.id || person.roles.includes('admin')
 }
 
 function canCancel(person, task) {
@@ -518,9 +535,33 @@ function paint(selector, key, html) {
 
 function showError(message, source = 'user') {
   const node = $('#error')
-  node.hidden = !message
-  node.textContent = message || ''
-  state.errorSource = message ? source : ''
+  const text = message || ''
+  const changed = node.hidden === Boolean(text) || node.textContent !== text
+  node.hidden = !text
+  node.textContent = text
+  state.errorSource = text ? source : ''
+  // 页面滚动较深时也能看到错误：只有新错误才滚动，轮询清空不会打扰。
+  if (text && changed) node.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
+/** 页面内提示：error/warn 用醒目底色并自动滚动到视野内，成功和中性提示保持普通样式。 */
+function renderNotice(selector, message, tone = '') {
+  const node = $(selector)
+  if (!node) return
+  const text = message || ''
+  const signature = `${tone}|${text}`
+  const changed = node.dataset.noticeSignature !== signature
+  node.hidden = !text
+  node.className = `notice${tone ? ' ' + tone : ''}`
+  node.textContent = text
+  if (!text) {
+    delete node.dataset.noticeSignature
+    return
+  }
+  node.dataset.noticeSignature = signature
+  if (changed && (tone === 'error' || tone === 'warn')) {
+    node.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }
 }
 
 function renderActors() {
@@ -769,6 +810,10 @@ function eventLine(event) {
       .join('；')
   }
   if (event.type === 'task.failed') return data.error || ''
+  if (event.type === 'task.retried') {
+    const from = data.fromTaskId ? `来自任务 ${data.fromTaskId}` : ''
+    return data.fromRejectedApproval ? `${from}（原任务审批被拒，本次按新请求处理）` : from
+  }
   return ''
 }
 
@@ -839,16 +884,22 @@ function renderDetail() {
       </div>
     </div>
   `).join('') : '<p class="muted">还没有工具调用。</p>'
+  const actions = [
+    canFinish(person, task) ? `<button type="button" class="ghost" data-finish="${esc(task.id)}">标记完成</button>` : '',
+    canRetry(person, task) ? `<button type="button" class="primary" data-retry="${esc(task.id)}">重试任务</button>` : '',
+    canCancel(person, task) ? `<button type="button" class="ghost" data-cancel="${esc(task.id)}">取消任务</button>` : '',
+  ].filter(Boolean).join('')
   const html = `
-    <div class="meta">${originPill(task.origin)}<span class="pill ${esc(task.status)}">${STATUS[task.status] || esc(task.status)}</span> ${esc(task.skill)} · ${esc(actorName(task.ownerId))} · ${esc(when(task.createdAt))}</div>
+    <div class="detail-head">
+      <div class="meta">${originPill(task.origin)}<span class="pill ${esc(task.status)}">${STATUS[task.status] || esc(task.status)}</span> ${esc(task.skill)} · ${esc(actorName(task.ownerId))} · ${esc(when(task.createdAt))}</div>
+      ${actions ? `<div class="detail-actions">${actions}</div>` : ''}
+    </div>
     <h2>${esc(task.title)}</h2>
     <p class="prompt">${esc(task.prompt)}</p>
     <p class="meta">任务号 ${esc(task.id)}${task.updatedAt ? ` · 更新 ${esc(when(task.updatedAt))}` : ''}${task.usage ? ` · ${task.usage.calls} 次模型调用 · ${task.usage.promptTokens} 输入 / ${task.usage.completionTokens} 输出 tokens${task.usage.cost !== undefined ? ` · 约 ${task.usage.cost} ${task.usage.currency || ''}`.trimEnd() : ''}` : ''}</p>
     ${streamPanel}
     ${task.result ? `<div class="result markdown">${renderMarkdown(task.result)}</div>` : ''}
     ${task.error ? `<p class="error">${esc(task.error)}</p>` : ''}
-    ${canFinish(person, task) ? `<button type="button" class="ghost" data-finish="${esc(task.id)}">标记完成</button>` : ''}
-    ${canCancel(person, task) ? `<button type="button" class="ghost" data-cancel="${esc(task.id)}">取消任务</button>` : ''}
     <h2>过程</h2>
     <ul class="timeline">${timeline}</ul>
     ${state.eventTotal > state.events.length ? `<p class="muted">仅显示最近 ${state.events.length} 条过程，共 ${state.eventTotal} 条。</p>` : ''}
@@ -869,7 +920,7 @@ function renderApprovals() {
     const reason = approval.status !== 'pending'
       ? ''
       : person?.id === approval.ownerId
-        ? '不能审批自己提交的变更'
+        ? (allowed ? '' : '不能审批自己提交的变更')
         : person?.roles.includes('approver')
           ? ''
           : '当前身份不能审批'
@@ -1169,11 +1220,7 @@ function renderMcp() {
     servers.map((item) => JSON.stringify(item)).join('|') + ':' + JSON.stringify(state.mcpHealth) || 'empty',
     rows,
   )
-  const notice = $('#mcp-notice')
-  if (notice) {
-    notice.hidden = !state.mcpNotice
-    notice.textContent = state.mcpNotice || ''
-  }
+  renderNotice('#mcp-notice', state.mcpNotice, state.mcpNoticeTone)
   const mcpStatus = $('#mcp-status')
   if (mcpStatus) {
     const errors = state.mcpErrors || []
@@ -1221,11 +1268,7 @@ function renderModel() {
     `${JSON.stringify(providers)}:${writable}`,
     rows,
   )
-  const notice = $('#model-notice')
-  if (notice) {
-    notice.hidden = !state.modelNotice
-    notice.textContent = state.modelNotice || ''
-  }
+  renderNotice('#model-notice', state.modelNotice, state.modelNoticeTone)
   const newButton = $('#model-new')
   if (newButton) newButton.hidden = !writable
   const form = $('#model-form')
@@ -1344,11 +1387,7 @@ function renderNotifications() {
     `
   }).join('') : '<tr><td colspan="6" class="empty">还没有通知 webhook。审批、任务失败和 MCP 状态变化不会推送。</td></tr>'
   paint('#notification-webhook-table', `${JSON.stringify(webhooks)}:${writable}`, rows)
-  const notice = $('#notification-notice')
-  if (notice) {
-    notice.hidden = !state.notificationNotice
-    notice.textContent = state.notificationNotice || ''
-  }
+  renderNotice('#notification-notice', state.notificationNotice, state.notificationNoticeTone)
   const newButton = $('#notification-new')
   if (newButton) newButton.hidden = !writable
   const form = $('#notification-form')
@@ -1470,11 +1509,7 @@ function renderAlertSources() {
     `
   }).join('') : '<tr><td colspan="7" class="empty">还没有告警接入源。新增后把回调地址和 Token 配到夜莺或 Alertmanager。</td></tr>'
   paint('#alert-source-table', `${JSON.stringify(state.alertSources)}:${writable}`, rows)
-  const notice = $('#alert-source-notice')
-  if (notice) {
-    notice.hidden = !state.alertSourceNotice
-    notice.textContent = state.alertSourceNotice || ''
-  }
+  renderNotice('#alert-source-notice', state.alertSourceNotice, state.alertSourceNoticeTone)
   const token = $('#alert-token')
   if (token) {
     token.hidden = !state.alertSourceToken
@@ -2111,8 +2146,35 @@ function syncNavGroups(view) {
   }
 }
 
+/** 切换页面时清掉页面级临时反馈：一次性 token、测试/保存提示和全局错误，返回时不显示旧结果。 */
+function clearTransientFeedback() {
+  state.keyToken = ''
+  state.keyTokenLabel = ''
+  state.alertSourceToken = ''
+  state.alertSourcePath = ''
+  state.mcpNotice = ''
+  state.mcpNoticeTone = ''
+  state.modelNotice = ''
+  state.modelNoticeTone = ''
+  state.notificationNotice = ''
+  state.notificationNoticeTone = ''
+  state.alertSourceNotice = ''
+  state.alertSourceNoticeTone = ''
+  paintKeyTokens()
+  for (const selector of ['#alert-token', '#asset-notice', '#asset-notice-manage', '#known-hosts-notice']) {
+    const node = $(selector)
+    if (!node) continue
+    node.hidden = true
+    node.textContent = ''
+  }
+  settingsNotice('')
+  showError('')
+}
+
 function switchView(view) {
+  const previous = state.view
   state.view = view
+  if (previous !== view) clearTransientFeedback()
   if (view === 'overview') state.overviewAt = 0
   const crumb = $('#crumb-page')
   if (crumb) crumb.textContent = VIEW_LABELS[view] || view
@@ -2121,7 +2183,6 @@ function switchView(view) {
     clearForm($('#credential-form'))
     setCredentialType()
   }
-  if (!ACCOUNT_VIEWS.includes(view)) settingsNotice('')
   syncNavGroups(view)
   if (view !== 'approvals') {
     state.approvalFocus = ''
@@ -2375,6 +2436,24 @@ $('#task-detail').addEventListener('click', async (event) => {
     }
     return
   }
+  const retryButton = event.target.closest('[data-retry]')
+  if (retryButton) {
+    if (!window.confirm('重新执行这个失败的任务？会新建一条任务并复制排查内容（按任务保留策略多保留一个周期），原任务和审计保留。')) return
+    try {
+      const created = await api('POST', `/api/tasks/${encodeURIComponent(retryButton.dataset.retry)}/retry`)
+      state.selectedId = created.task.id
+      state.task = created.task
+      state.events = []
+      state.audit = []
+      state.tasks = [created.task, ...state.tasks.filter((task) => task.id !== created.task.id)]
+      showError('')
+      render()
+      await refresh()
+    } catch (error) {
+      showError(error.message)
+    }
+    return
+  }
   const button = event.target.closest('[data-cancel]')
   if (!button) return
   if (!window.confirm('取消这个任务？挂起的审批会一并作废，不会执行任何变更。')) return
@@ -2464,6 +2543,8 @@ $('#approval-list').addEventListener('click', async (event) => {
   const button = event.target.closest('[data-decision]')
   if (!button) return
   const card = button.closest('[data-approval]')
+  const approval = findApproval(card.dataset.approval)
+  if (approval?.ownerId === state.actorId && !window.confirm('这是你自己发起的变更，确认由自己批准？审计会记录同一个人。')) return
   const comment = card.querySelector('[data-comment]')?.value || ''
   try {
     const result = await api('POST', `/api/approvals/${card.dataset.approval}`, { decision: button.dataset.decision, comment })
@@ -2834,6 +2915,7 @@ $('#mcp-connection-table').addEventListener('click', async (event) => {
     const result = await api('POST', `/api/mcp-servers/${encodeURIComponent(name)}/review`)
     state.mcpHealth = result.health || []
     state.mcpNotice = `${name} 工具集复核已确认。`
+    state.mcpNoticeTone = 'ok'
     showError('')
     await refresh()
   } catch (error) {
@@ -2847,9 +2929,11 @@ $('#mcp-health-check').addEventListener('click', async () => {
   try {
     const result = await api('POST', '/api/mcp-servers/health')
     const health = result.health || []
-    state.mcpNotice = health.every((item) => item.ok)
+    const allHealthy = health.every((item) => item.ok)
+    state.mcpNotice = allHealthy
       ? 'MCP 健康检测完成：全部正常。'
       : 'MCP 健康检测完成：有 server 异常，详见健康列和错误提示。'
+    state.mcpNoticeTone = allHealthy ? 'ok' : 'warn'
     showError('')
     await refresh()
   } catch (error) {
@@ -2889,6 +2973,7 @@ $('#mcp-save').addEventListener('click', async () => {
     state.mcpServers = result.servers
     state.mcpHealth = result.health || []
     state.mcpNotice = 'MCP 配置已保存并已热加载。'
+    state.mcpNoticeTone = 'ok'
     $('#mcp-json').value = JSON.stringify(result.servers, null, 2)
     showError('')
     await refresh()
@@ -2905,9 +2990,11 @@ $('#model-reload').addEventListener('click', async () => {
   try {
     await loadModelProviders(true)
     state.modelNotice = '模型 provider 列表已刷新。'
+    state.modelNoticeTone = 'ok'
     renderModel()
   } catch (error) {
     state.modelNotice = error.message
+    state.modelNoticeTone = 'error'
     renderModel()
   }
 })
@@ -2923,6 +3010,7 @@ $('#model-save').addEventListener('click', async () => {
   const defaultModel = String(data.get('defaultModel') || '').trim()
   if (!name || !baseUrl || !defaultModel) {
     state.modelNotice = '名称、Base URL 和默认模型必填。'
+    state.modelNoticeTone = 'error'
     renderModel()
     return
   }
@@ -2949,6 +3037,7 @@ $('#model-save').addEventListener('click', async () => {
     if (raw !== '') payload[key] = Number(raw)
     if (raw !== '' && !Number.isFinite(payload[key])) {
       state.modelNotice = `${key} 必须是数字。`
+      state.modelNoticeTone = 'error'
       renderModel()
       return
     }
@@ -2959,6 +3048,7 @@ $('#model-save').addEventListener('click', async () => {
     else if (editing) payload[key] = null
     if (raw !== '' && !Number.isFinite(payload[key])) {
       state.modelNotice = `${key} 必须是数字。`
+      state.modelNoticeTone = 'error'
       renderModel()
       return
     }
@@ -2971,9 +3061,11 @@ $('#model-save').addEventListener('click', async () => {
     state.modelEditing = ''
     await loadModelProviders(true)
     state.modelNotice = `已保存 ${result.provider.name}。`
+    state.modelNoticeTone = 'ok'
     renderModel()
   } catch (error) {
     state.modelNotice = error.message
+    state.modelNoticeTone = 'error'
     renderModel()
   }
 })
@@ -2995,8 +3087,10 @@ $('#model-provider-table').addEventListener('click', async (event) => {
         ...(provider ? { model: provider.defaultModel } : {}),
       })
       state.modelNotice = `${name} 连接成功：模型 ${result.result.model}，耗时 ${result.result.latencyMs}ms，回复「${result.result.reply || '空'}」。`
+      state.modelNoticeTone = 'ok'
     } catch (error) {
       state.modelNotice = `${name} 连接失败：${error.message}`
+      state.modelNoticeTone = 'error'
     } finally {
       test.disabled = false
       renderModel()
@@ -3018,8 +3112,10 @@ $('#model-provider-table').addEventListener('click', async (event) => {
         form.elements.namedItem('defaultModel').value = models[0]
       }
       state.modelNotice = `拉取到 ${models.length} 个模型，确认后点保存生效。`
+      state.modelNoticeTone = 'ok'
     } catch (error) {
       state.modelNotice = `${name} 拉取模型失败：${error.message}`
+      state.modelNoticeTone = 'error'
     } finally {
       discover.disabled = false
       renderModel()
@@ -3033,10 +3129,12 @@ $('#model-provider-table').addEventListener('click', async (event) => {
   try {
     await api('DELETE', `/api/model-providers/${encodeURIComponent(name)}`)
     state.modelNotice = `已删除 ${name}。`
+    state.modelNoticeTone = 'ok'
     await loadModelProviders(true)
     if (state.modelEditing === name) closeModelEditor()
   } catch (error) {
     state.modelNotice = error.message
+    state.modelNoticeTone = 'error'
   }
   renderModel()
 })
@@ -3048,6 +3146,7 @@ $('#notification-cancel').addEventListener('click', closeNotificationEditor)
 $('#notification-reload').addEventListener('click', async () => {
   await loadNotifications(true)
   state.notificationNotice = '通知配置已刷新。'
+  state.notificationNoticeTone = 'ok'
   renderNotifications()
 })
 
@@ -3056,6 +3155,7 @@ $('#notification-settings-save').addEventListener('click', async () => {
   const minIntervalMs = Number(form.elements.namedItem('minIntervalMs').value)
   if (!Number.isInteger(minIntervalMs) || minIntervalMs < 0) {
     state.notificationNotice = '最小间隔必须是非负整数。'
+    state.notificationNoticeTone = 'error'
     renderNotifications()
     return
   }
@@ -3066,9 +3166,11 @@ $('#notification-settings-save').addEventListener('click', async () => {
     })
     state.notifications.settings = result.settings
     state.notificationNotice = '通知设置已保存。'
+    state.notificationNoticeTone = 'ok'
     showError('')
   } catch (error) {
     state.notificationNotice = error.message
+    state.notificationNoticeTone = 'error'
   }
   renderNotifications()
 })
@@ -3085,16 +3187,19 @@ $('#notification-save').addEventListener('click', async () => {
     .map((input) => input.dataset.notificationEvent)
   if (!name) {
     state.notificationNotice = '名称必填。'
+    state.notificationNoticeTone = 'error'
     renderNotifications()
     return
   }
   if (!editingId && !url) {
     state.notificationNotice = '新增 webhook 必须填写 URL。'
+    state.notificationNoticeTone = 'error'
     renderNotifications()
     return
   }
   if (events.length === 0) {
     state.notificationNotice = '至少选择一个事件。'
+    state.notificationNoticeTone = 'error'
     renderNotifications()
     return
   }
@@ -3114,9 +3219,11 @@ $('#notification-save').addEventListener('click', async () => {
     state.notificationEditing = ''
     await loadNotifications(true)
     state.notificationNotice = editingId ? `已更新 ${name}。` : `已新增 ${name}。`
+    state.notificationNoticeTone = 'ok'
     showError('')
   } catch (error) {
     state.notificationNotice = error.message
+    state.notificationNoticeTone = 'error'
   }
   renderNotifications()
 })
@@ -3137,8 +3244,10 @@ $('#notification-webhook-table').addEventListener('click', async (event) => {
       state.notificationNotice = result.result?.ok
         ? `${result.result.webhook} 测试消息已发送。`
         : `${result.result?.webhook || id} 测试失败：${result.result?.error || '未知错误'}`
+      state.notificationNoticeTone = result.result?.ok ? 'ok' : 'error'
     } catch (error) {
       state.notificationNotice = `测试失败：${error.message}`
+      state.notificationNoticeTone = 'error'
     } finally {
       test.disabled = false
       renderNotifications()
@@ -3154,9 +3263,11 @@ $('#notification-webhook-table').addEventListener('click', async (event) => {
     await api('DELETE', `/api/notifications/webhooks/${encodeURIComponent(id)}`)
     await loadNotifications(true)
     state.notificationNotice = `已删除 ${webhook?.name || id}。`
+    state.notificationNoticeTone = 'ok'
     if (state.notificationEditing === id) closeNotificationEditor()
   } catch (error) {
     state.notificationNotice = error.message
+    state.notificationNoticeTone = 'error'
   }
   renderNotifications()
 })
@@ -3168,6 +3279,7 @@ $('#alert-source-cancel').addEventListener('click', closeAlertSourceEditor)
 $('#alert-source-reload').addEventListener('click', async () => {
   await loadAlertSources(true)
   state.alertSourceNotice = '告警接入配置已刷新。'
+  state.alertSourceNoticeTone = 'ok'
   renderAlertSources()
 })
 
@@ -3181,16 +3293,19 @@ $('#alert-source-save').addEventListener('click', async () => {
   const cooldownMinutes = Number(form.elements.namedItem('cooldownMinutes').value)
   if (!name) {
     state.alertSourceNotice = '名称必填。'
+    state.alertSourceNoticeTone = 'error'
     renderAlertSources()
     return
   }
   if (!actorId) {
     state.alertSourceNotice = '请选择归属账号。'
+    state.alertSourceNoticeTone = 'error'
     renderAlertSources()
     return
   }
   if (!Number.isInteger(cooldownMinutes) || cooldownMinutes < 0 || cooldownMinutes > 1440) {
     state.alertSourceNotice = '冷却窗口必须是 0-1440 的整数分钟。'
+    state.alertSourceNoticeTone = 'error'
     renderAlertSources()
     return
   }
@@ -3221,12 +3336,15 @@ $('#alert-source-save').addEventListener('click', async () => {
       state.alertSourceToken = result.token
       state.alertSourcePath = result.source.path
       state.alertSourceNotice = `已创建 ${name}，请把接入地址和 Token 配置到告警系统。`
+      state.alertSourceNoticeTone = 'ok'
     } else {
       state.alertSourceNotice = `已更新 ${name}。`
+      state.alertSourceNoticeTone = 'ok'
     }
     showError('')
   } catch (error) {
     state.alertSourceNotice = error.message
+    state.alertSourceNoticeTone = 'error'
   }
   renderAlertSources()
 })
@@ -3247,8 +3365,10 @@ $('#alert-source-table').addEventListener('click', async (event) => {
       state.alertSourceNotice = result.accepted
         ? `已用模拟告警发起排查任务 ${result.taskId}，可在任务页查看。`
         : `未发起排查：${ALERT_REASONS[result.reason] || result.reason || '被忽略'}。`
+      state.alertSourceNoticeTone = result.accepted ? 'ok' : 'warn'
     } catch (error) {
       state.alertSourceNotice = `测试失败：${error.message}`
+      state.alertSourceNoticeTone = 'error'
     } finally {
       test.disabled = false
       renderAlertSources()
@@ -3265,9 +3385,11 @@ $('#alert-source-table').addEventListener('click', async (event) => {
       state.alertSourceToken = result.token
       state.alertSourcePath = result.source.path
       state.alertSourceNotice = `已轮换 ${source?.name || id} 的 Token，请更新告警系统配置。`
+      state.alertSourceNoticeTone = 'ok'
       await loadAlertSources(true)
     } catch (error) {
       state.alertSourceNotice = error.message
+      state.alertSourceNoticeTone = 'error'
     }
     renderAlertSources()
     return
@@ -3281,9 +3403,11 @@ $('#alert-source-table').addEventListener('click', async (event) => {
     await api('DELETE', `/api/alert-sources/${encodeURIComponent(id)}`)
     await loadAlertSources(true)
     state.alertSourceNotice = `已删除 ${source?.name || id}。`
+    state.alertSourceNoticeTone = 'ok'
     if (state.alertSourceEditing === id) closeAlertSourceEditor()
   } catch (error) {
     state.alertSourceNotice = error.message
+    state.alertSourceNoticeTone = 'error'
   }
   renderAlertSources()
 })
@@ -3351,6 +3475,7 @@ $('#password-form')?.addEventListener('submit', async (event) => {
     })
     clearForm(form)
     if (state.me) state.me.mustChangePassword = false
+    showError('')
     settingsNotice('密码已修改，其他设备上的会话已失效。')
     await refresh()
   } catch (error) {
@@ -3603,6 +3728,7 @@ $('#who').addEventListener('click', (event) => {
   state.tools = []
   state.skills = []
   state.mcpNotice = ''
+  state.mcpNoticeTone = ''
   state.mcpServers = []
   state.mcpHealth = []
   state.mcpEditorOpen = false
@@ -3668,6 +3794,7 @@ async function loadSession() {
   state.authMethod = data.method || 'session'
   state.csrfToken = data.csrfToken || ''
   state.me = data.user
+  state.allowAdminSelfApproval = data.allowAdminSelfApproval === true
   state.actorId = data.user.id
   const self = {
     id: data.user.id,

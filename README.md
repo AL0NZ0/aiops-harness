@@ -133,6 +133,7 @@ npm run start:prod
 | MCP | `MCP_*_TOKEN` + `${ENV_NAME}` 占位 | 上游 token 从环境注入，不写进 JSON 明文 |
 | 模型 | `AIOPS_MODEL_BASE_URL` / `NAME` / `API_KEY` | 没有 provider 时的可选兜底 |
 | 保留 | `AIOPS_APPROVAL_TTL_MS` / `TASK_RETENTION_DAYS` / `EVENT_RETENTION_DAYS` | 审批过期和任务/事件清理 |
+| 审批 | `AIOPS_ALLOW_ADMIN_SELF_APPROVAL` | 默认关闭；设为 `1` 才允许 admin 审批自己发起的变更，approver/operator 始终不行 |
 | 巡检 | `AIOPS_MCP_HEALTH_MS` | 默认 30000；`0` 关闭 |
 | 告警 | `AIOPS_ALERT_SOURCES_FILE` / `AIOPS_ALERT_MAX_CONCURRENCY` | 接入源文件默认 `data/alert-sources.json`，并发排查上限默认 3 |
 | 可观测 | `AIOPS_METRICS_TOKEN` / `AIOPS_LOG_REQUESTS` | 指标鉴权和访问日志 |

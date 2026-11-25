@@ -399,12 +399,12 @@
         <h1>MCP 连接</h1>
         <p>平台只通过上游 MCP server 访问外部系统；保存前探测，热加载，后台巡检</p>
       </div>
-      <p id="mcp-notice" class="hint" hidden></p>
+      <p id="mcp-notice" class="notice" hidden></p>
       <div class="toolbar">
         <button type="button" class="ghost" id="mcp-edit-toggle">编辑 MCP 配置</button>
         <button type="button" class="ghost" id="mcp-health-check">健康检测</button>
       </div>
-      <p id="mcp-status" class="hint" hidden></p>
+      <p id="mcp-status" class="notice warn" hidden></p>
       <div class="table-wrap">
         <table class="table">
           <thead>
@@ -437,7 +437,7 @@
         <h1>模型</h1>
         <p>平台任务执行器使用的 OpenAI 兼容端点；DSH 和 WorkBuddy 有自己的模型配置，不受这里影响</p>
       </div>
-      <p id="model-notice" class="hint" hidden></p>
+      <p id="model-notice" class="notice" hidden></p>
       <div class="toolbar">
         <button type="button" class="ghost" id="model-new">新增 Provider</button>
         <button type="button" class="ghost" id="model-reload">刷新</button>
@@ -546,7 +546,7 @@
         <h1>通知</h1>
         <p>审批、任务失败、MCP 健康和 SSH 主机密钥变化推送到钉钉、企业微信或通用 webhook</p>
       </div>
-      <p id="notification-notice" class="hint" hidden></p>
+      <p id="notification-notice" class="notice" hidden></p>
       <form id="notification-settings" class="composer">
         <div class="composer-row">
           <label class="inline"><input type="checkbox" name="enabled" checked /> 启用通知</label>
@@ -623,7 +623,7 @@
         <h1>告警接入</h1>
         <p>夜莺 v6 回调或 Webhook、Alertmanager 推送告警，平台自动发起只读排查；结果可推送到指定通知渠道</p>
       </div>
-      <p id="alert-source-notice" class="hint" hidden></p>
+      <p id="alert-source-notice" class="notice" hidden></p>
       <p id="alert-token" class="notice warn-text mono" hidden></p>
       <div class="toolbar">
         <button type="button" class="ghost" id="alert-source-new">新增接入源</button>

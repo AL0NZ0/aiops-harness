@@ -364,6 +364,11 @@ export interface PlatformOptions {
   instanceId?: string
   /** 审批等待的跨实例轮询间隔，默认 2000ms；<=0 关闭轮询。 */
   approvalPollMs?: number
+  /**
+   * 允许 admin 审批自己发起的变更，默认关闭。
+   * 只对 admin 生效，approver/operator 永远不能自批；开启后页面二次确认，审计仍记录同一 actor。
+   */
+  allowAdminSelfApproval?: boolean
   /** 兼容旧的单一模型配置；配置后网页/平台任务改为模型驱动。 */
   model?: ChatModel
   /** 多 provider 解析器；优先于 model。没有可用 provider 时返回 undefined，退回 playbook。 */
@@ -376,6 +381,8 @@ export interface PlatformOptions {
   notify?: (event: NotificationEvent) => void
   /** 后台状态变化写入安全事件；实现失败只记日志，不影响巡检。 */
   audit?: (action: string, detail: Record<string, unknown>) => void
+  /** 任务级特权操作写入安全事件（如 admin 代重试）；失败不影响主流程。 */
+  securityEvent?: (type: string, detail: Record<string, unknown>) => void
   /** 逐工具审批策略；只有 admin 能写，策略签名和上游工具不一致时自动失效。 */
   toolPolicies?: ToolPolicyStore
   /** 告警接入源；外部监控通过 /api/hooks/alerts/<sourceId> 触发只读排查任务。 */
@@ -496,7 +503,12 @@ export class Platform {
     this.store = options.store ?? new MemoryStore()
     this.gate = new ApprovalGate(options.approvalPollMs)
     for (const tool of options.tools) this.toolBaseRisk.set(tool.name, tool.risk)
-    this.broker = new ToolBroker(options.tools, this.store, options.actors)
+    this.broker = new ToolBroker(
+      options.tools,
+      this.store,
+      options.actors,
+      options.allowAdminSelfApproval === true,
+    )
     this.mcpErrors = options.mcpErrors ?? []
     for (const error of this.mcpErrors) {
       this.health.set(error.name, {
@@ -543,6 +555,61 @@ export class Platform {
 
   async createTask(actorId: string, input: CreateTaskInput): Promise<Task> {
     return this.enqueueTask(actorId, input, 'web')
+  }
+
+  /**
+   * 重试失败的网页任务：复制 prompt/技能和当时的 provider/model，新建一条任务，原任务保留。
+   * 只允许 origin=web 且状态 failed；告警任务和外部 Agent 任务不提供重试。
+   */
+  async retryTask(actorId: string, taskId: string): Promise<Task> {
+    const actor = this.requireActor(actorId)
+    if (!isOperator(actor)) throw new PlatformError('当前身份不能重试任务', 403, 'forbidden')
+    const original = await this.getTask(actorId, taskId)
+    if ((original.origin ?? 'web') !== 'web') {
+      throw new PlatformError('只有平台网页任务可以重试', 409, 'conflict')
+    }
+    if (original.status !== 'failed') {
+      throw new PlatformError('只有失败的任务可以重试', 409, 'conflict')
+    }
+    if (original.ownerId !== actor.id && !isAdmin(actor)) {
+      throw new PlatformError('只能重试自己发起的任务', 403, 'forbidden')
+    }
+    const events = await this.store.eventsFor(original.id)
+    // 复现当时的模型选择；任务失败在 task.started 之前时按默认 provider/model 重试。
+    const started = events.find((event) => event.type === 'task.started')
+    const data = (started?.data ?? {}) as { provider?: unknown; model?: unknown }
+    const task = await this.enqueueTask(actor.id, {
+      title: original.title,
+      prompt: original.prompt,
+      skill: original.skill,
+      ...(typeof data.provider === 'string' && data.provider ? { provider: data.provider } : {}),
+      ...(typeof data.model === 'string' && data.model ? { model: data.model } : {}),
+    }, 'web')
+    // 原任务曾被拒绝过审批时，这次重试是新请求，标记出来方便审计区分。
+    const fromRejectedApproval = events.some(
+      (event) => event.type === 'approval.decided' && (event.data as { status?: unknown } | undefined)?.status === 'rejected',
+    )
+    const trace = {
+      fromTaskId: original.id,
+      actorId: actor.id,
+      fromOwnerId: original.ownerId,
+      ...(fromRejectedApproval ? { fromRejectedApproval: true } : {}),
+    }
+    // 不改原任务状态，只在新任务留一条来源事件，便于追溯重试链。
+    await this.store.appendEvent({
+      id: nid('evt'),
+      taskId: task.id,
+      type: 'task.retried',
+      at: new Date().toISOString(),
+      data: trace,
+    })
+    // 安全事件只记标识，不写 prompt、模型输出或错误详情。
+    this.securityEvent('task.retried', {
+      ...trace,
+      userId: actor.id,
+      username: actor.name,
+    })
+    return task
   }
 
   private async enqueueTask(
@@ -1218,6 +1285,11 @@ export class Platform {
     return { approvals: result.items.map((approval) => structuredClone(approval)), total: result.total }
   }
 
+  /** 是否允许 admin 自批；网页用它决定要不要显示自己名下审批的操作按钮。 */
+  get adminSelfApprovalAllowed(): boolean {
+    return this.options.allowAdminSelfApproval === true
+  }
+
   async decideApproval(actorId: string, approvalId: string, decision: string, comment?: string): Promise<Approval> {
     const actor = this.requireActor(actorId)
     if (!isApprover(actor)) throw new PlatformError('当前身份不能审批', 403, 'forbidden')
@@ -1230,7 +1302,11 @@ export class Platform {
     const approval = await this.store.getApproval(approvalId)
     if (!approval) throw new PlatformError('审批不存在', 404, 'not_found')
     if (approval.status !== 'pending') throw new PlatformError('审批已经处理过', 409, 'conflict')
-    if (actor.id === approval.ownerId) throw new PlatformError('不能审批自己名下的变更', 403, 'forbidden')
+    const selfApproval = actor.id === approval.ownerId
+    // 默认禁止自批；只有显式开启开关时 admin 可以，approver/operator 永远不行。
+    if (selfApproval && !(isAdmin(actor) && this.options.allowAdminSelfApproval === true)) {
+      throw new PlatformError('不能审批自己名下的变更', 403, 'forbidden')
+    }
     const decidedAt = new Date().toISOString()
     const note = comment?.trim()
     let failedTask: Task | undefined
@@ -1267,7 +1343,12 @@ export class Platform {
             }
           }
         }
-        await this.emitWith(tx, task, 'approval.decided', { approvalId: approval.id, status: decision, decidedBy: actor.id })
+        await this.emitWith(tx, task, 'approval.decided', {
+          approvalId: approval.id,
+          status: decision,
+          decidedBy: actor.id,
+          ...(selfApproval ? { selfApproved: true } : {}),
+        })
         if (failedNow) {
           await this.emitWith(tx, task, 'task.failed', { error: task.error ?? '审批被拒绝' })
           failedTask = structuredClone(task)
@@ -2577,6 +2658,15 @@ export class Platform {
       this.options.notify({ type, title, text, dedupeKey, ...(detail ? { detail } : {}), at: new Date().toISOString() })
     } catch {
       // 通知是旁路，失败不影响主流程。
+    }
+  }
+
+  private securityEvent(type: string, detail: Record<string, unknown>): void {
+    if (!this.options.securityEvent) return
+    try {
+      this.options.securityEvent(type, detail)
+    } catch {
+      // 安全事件是旁路，失败不影响任务。
     }
   }
 
