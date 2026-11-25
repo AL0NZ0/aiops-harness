@@ -115,6 +115,55 @@ test('登录失败达到阈值后锁定，过期后可以恢复', async () => {
   assert.equal(login.user.username, 'alice')
 })
 
+test('管理员可以查看并清除登录锁定，重置密码也会自动清除', async () => {
+  const ctx = setup({ maxLoginFailures: 3 })
+  const user = await ctx.service.createUser({ username: 'alice', password: PASSWORD, roles: ['operator'] })
+  for (let index = 0; index < 3; index += 1) {
+    await assert.rejects(
+      () => ctx.service.login('alice', 'wrong password', { ip: '10.0.0.1' }),
+      (error: unknown) => error instanceof AuthError && error.code === 'invalid_credentials',
+    )
+  }
+  for (let index = 0; index < 2; index += 1) {
+    await assert.rejects(
+      () => ctx.service.login('alice', 'wrong password', { ip: '10.0.0.2' }),
+      (error: unknown) => error instanceof AuthError && error.code === 'invalid_credentials',
+    )
+  }
+
+  const locks = await ctx.service.listLoginLocks()
+  assert.equal(locks.length, 2)
+  const locked = locks.find((item) => item.ip === '10.0.0.1')
+  assert.equal(locked?.username, 'alice')
+  assert.equal(locked?.failures, 3)
+  assert.ok(locked?.lockedUntil)
+  assert.equal(locks.find((item) => item.ip === '10.0.0.2')?.lockedUntil, undefined)
+
+  // 解锁按用户名清掉所有来源 IP 的失败记录。
+  assert.equal(await ctx.service.clearLoginLocks('ALICE', { ip: '10.0.0.9' }), 5)
+  assert.deepEqual(await ctx.service.listLoginLocks(), [])
+  assert.equal((await ctx.service.login('alice', PASSWORD, { ip: '10.0.0.1' })).user.username, 'alice')
+
+  // 重置密码同样清除锁定，管理员改完密码后用户能立即登录。
+  for (let index = 0; index < 3; index += 1) {
+    await assert.rejects(
+      () => ctx.service.login('alice', 'wrong password', { ip: '10.0.0.3' }),
+      (error: unknown) => error instanceof AuthError && error.code === 'invalid_credentials',
+    )
+  }
+  assert.ok((await ctx.service.listLoginLocks())[0]?.lockedUntil)
+  await ctx.service.resetPassword(user.id, 'replacement horse battery staple')
+  assert.deepEqual(await ctx.service.listLoginLocks(), [])
+  assert.equal(
+    (await ctx.service.login('alice', 'replacement horse battery staple', { ip: '10.0.0.3' })).user.username,
+    'alice',
+  )
+
+  const events = await ctx.store.listSecurityEvents(100)
+  assert.ok(events.some((event) => event.type === 'auth.login_locks_cleared' && event.detail?.failures === 5))
+  assert.ok(events.some((event) => event.type === 'auth.password_reset' && event.detail?.locksCleared === 3))
+})
+
 test('登录失败计数在共享存储里，多个实例共用同一把锁', async () => {
   const store = new MemoryAuthStore()
   let clock = new Date('2026-11-19T00:00:00.000Z')

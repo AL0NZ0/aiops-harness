@@ -263,6 +263,88 @@ test('本地资产可以页面管理并被资产工具读取', async () => {
   }
 })
 
+test('SSH 只读日志路径只有管理员能改，普通保存不会清空已有配置', async () => {
+  const ctx = await boot()
+  try {
+    const created = await api(ctx.base, 'alice', 'POST', '/api/assets', {
+      name: 'log-01',
+      host: 'log-01',
+      ip: '10.0.0.9',
+    })
+    assert.equal(created.status, 200)
+
+    const denied = await api(ctx.base, 'alice', 'POST', '/api/assets', {
+      name: 'log-01',
+      host: 'log-01',
+      ip: '10.0.0.9',
+      sshReadPaths: ['/var/log/nginx'],
+    })
+    assert.equal(denied.status, 403)
+    assert.match(String(denied.body.error?.message), /只有管理员/)
+
+    const granted = await api(ctx.base, 'root', 'POST', '/api/assets', {
+      name: 'log-01',
+      host: 'log-01',
+      ip: '10.0.0.9',
+      sshReadPaths: ['/var/log/nginx/', '/srv/app/logs'],
+    })
+    assert.equal(granted.status, 200)
+    assert.deepEqual(granted.body.asset.sshReadPaths, ['/srv/app/logs', '/var/log/nginx'])
+
+    const bad = await api(ctx.base, 'root', 'POST', '/api/assets', {
+      name: 'log-01',
+      host: 'log-01',
+      sshReadPaths: ['/var/log/../etc'],
+    })
+    assert.equal(bad.status, 400)
+
+    // operator 不带 sshReadPaths 的保存不算修改，已有配置必须保留。
+    const touched = await api(ctx.base, 'alice', 'POST', '/api/assets', {
+      name: 'log-01',
+      host: 'log-01',
+      ip: '10.0.0.9',
+      owner: 'ops-team',
+    })
+    assert.equal(touched.status, 200)
+    assert.deepEqual(touched.body.asset.sshReadPaths, ['/srv/app/logs', '/var/log/nginx'])
+
+    const narrowing = await api(ctx.base, 'alice', 'POST', '/api/assets', {
+      name: 'log-01',
+      host: 'log-01',
+      ip: '10.0.0.9',
+      sshReadPaths: [],
+    })
+    assert.equal(narrowing.status, 403)
+
+    // 管理员显式传空数组等于清空，不能因为「没变化就保留」被吃掉。
+    const cleared = await api(ctx.base, 'root', 'POST', '/api/assets', {
+      name: 'log-01',
+      host: 'log-01',
+      ip: '10.0.0.9',
+      sshReadPaths: [],
+    })
+    assert.equal(cleared.status, 200)
+    assert.equal(cleared.body.asset.sshReadPaths, undefined)
+    const listed = await api(ctx.base, 'alice', 'GET', '/api/assets')
+    const record = listed.body.assets.find((item: { name: string }) => item.name === 'log-01')
+    assert.equal(record.sshReadPaths, undefined)
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('资产 SSH 连接测试接口按角色放行并检查资产存在', async () => {
+  const ctx = await boot()
+  try {
+    assert.equal((await api(ctx.base, 'carol', 'POST', '/api/assets/demo/ssh-test')).status, 403)
+    const missing = await api(ctx.base, 'alice', 'POST', '/api/assets/demo/ssh-test')
+    assert.equal(missing.status, 404)
+    assert.match(String(missing.body.error?.message), /资产不存在/)
+  } finally {
+    await ctx.close()
+  }
+})
+
 test('MCP 配置可以在线校验和保存', async () => {
   const ctx = await boot()
   try {

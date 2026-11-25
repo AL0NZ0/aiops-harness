@@ -7,6 +7,7 @@ import {
   plaintextCodec,
   type SecretCodec,
 } from './secret-box.ts'
+import { normalizeReadPaths } from './ssh-read.ts'
 
 export interface AssetRecord {
   name: string
@@ -27,6 +28,11 @@ export interface AssetRecord {
   sshHostKeyFingerprint?: string
   /** 跳板机资产名；连接目标前先经这些主机转发。 */
   sshJumpAsset?: string
+  /**
+   * `ssh.logs` 允许读取的绝对路径（文件或目录前缀）。只有 admin 能改；
+   * 为空表示该资产不开放文件日志读取，仍需 ssh.exec 走审批。
+   */
+  sshReadPaths?: string[]
 }
 
 export interface AssetView {
@@ -45,6 +51,7 @@ export interface AssetView {
   hasKey: boolean
   sshHostKeyFingerprint?: string
   sshJumpAsset?: string
+  sshReadPaths?: string[]
 }
 
 const SECRETS = ['sshPassword', 'sshKey', 'sshPassphrase'] as const
@@ -111,6 +118,10 @@ export class AssetStore {
       if (endpointChanged) record.sshHostKeyFingerprint = undefined
       else if (!record.sshHostKeyFingerprint && existing.sshHostKeyFingerprint) {
         record.sshHostKeyFingerprint = existing.sshHostKeyFingerprint
+      }
+      // 未显式提供时保留原列表，避免普通编辑把管理员配置的只读路径清空。
+      if (record.sshReadPaths === undefined && existing.sshReadPaths) {
+        record.sshReadPaths = existing.sshReadPaths
       }
     }
     if (record.sshCredentialId) {
@@ -220,6 +231,7 @@ export function toAssetView(asset: AssetRecord): AssetView {
   if (asset.sshPort) view.sshPort = asset.sshPort
   if (asset.sshHostKeyFingerprint) view.sshHostKeyFingerprint = asset.sshHostKeyFingerprint
   if (asset.sshJumpAsset) view.sshJumpAsset = asset.sshJumpAsset
+  if (asset.sshReadPaths?.length) view.sshReadPaths = [...asset.sshReadPaths]
   return view
 }
 
@@ -248,6 +260,8 @@ function normalize(input: AssetRecord): AssetRecord {
     if (value.trim()) record[key] = value
   }
   if (input.sshHostKeyFingerprint) record.sshHostKeyFingerprint = normalizeFingerprint(input.sshHostKeyFingerprint)
+  // 显式传空数组表示清空；只有完全没传才会在 upsert 时保留原值。
+  if (input.sshReadPaths !== undefined) record.sshReadPaths = normalizeReadPaths(input.sshReadPaths)
   const jump = typeof input.sshJumpAsset === 'string' ? input.sshJumpAsset.trim() : ''
   if (jump) {
     if (!NAME.test(jump)) throw new Error('sshJumpAsset 不合法')

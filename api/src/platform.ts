@@ -31,7 +31,8 @@ import { nid, redact } from './ids.ts'
 import type { ChatMessage, ChatModel, ChatTool, ChatToolCall } from './model.ts'
 import type { DeliveredNotification, NotificationEvent, NotificationType } from './notifications.ts'
 import { MAX_KNOWN_HOSTS_BYTES, matchAsset, parseKnownHosts } from './known-hosts.ts'
-import { probeHostKey, resolveJumpTargets } from './ssh-tools.ts'
+import { normalizeReadPaths } from './ssh-read.ts'
+import { probeHostKey, resolveJumpTargets, testAssetConnection } from './ssh-tools.ts'
 import { renderArgs, selectSkill, stepMatches, type Skill } from './skills.ts'
 import { MemoryStore, type Store, type StoreTx, type TaskQuery } from './store.ts'
 import {
@@ -57,6 +58,25 @@ function isApprover(actor: Actor): boolean {
 
 function isAdmin(actor: Actor): boolean {
   return actor.roles.includes('admin')
+}
+
+/** 把 ssh2 的英文底层错误翻译成运维能直接行动的提示。 */
+function describeSshConnectError(error: unknown): string {
+  const text = error instanceof Error ? error.message : 'SSH 连接测试失败'
+  if (/All configured authentication methods failed/i.test(text)) {
+    return 'SSH 认证失败：用户名、密码或私钥没有被目标主机接受'
+  }
+  if (/Host key verification failed|主机密钥/i.test(text)) return text
+  if (/Timed out while waiting|Timed out|timeout/i.test(text)) return 'SSH 连接超时：检查 IP、端口、网络和防火墙'
+  if (/ECONNREFUSED/i.test(text)) return 'SSH 连接被拒绝：目标端口没有服务监听'
+  if (/EHOSTUNREACH|ENETUNREACH/i.test(text)) return 'SSH 网络不可达：检查路由和网络策略'
+  if (/ENOTFOUND|EAI_AGAIN/i.test(text)) return 'SSH 主机名解析失败：检查资产的主机名或 IP'
+  return text
+}
+
+/** 只读路径列表比较：两边都已规范化排序。 */
+function sameReadPaths(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((item, index) => item === b[index])
 }
 
 /** readOnly/mutateTools 决定工具默认风险，属于风险配置，非 admin 不能改。 */
@@ -1348,6 +1368,23 @@ export class Platform {
     if (!isOperator(actor)) {
       throw new PlatformError('当前身份不能修改资产', 403, 'forbidden')
     }
+    const name = typeof input.name === 'string' ? input.name.trim() : ''
+    const existing = name ? await this.options.assets.get(name) : undefined
+    const previousPaths = existing?.sshReadPaths ?? []
+    if (input.sshReadPaths !== undefined) {
+      let requested: string[]
+      try {
+        requested = normalizeReadPaths(input.sshReadPaths)
+      } catch (error) {
+        throw new PlatformError(error instanceof Error ? error.message : 'sshReadPaths 不合法', 400, 'bad_request')
+      }
+      if (!sameReadPaths(requested, previousPaths) && !isAdmin(actor)) {
+        throw new PlatformError('只有管理员可以修改 SSH 只读路径', 403, 'forbidden')
+      }
+      input = { ...input, sshReadPaths: requested }
+    } else if (previousPaths.length) {
+      input = { ...input, sshReadPaths: [...previousPaths] }
+    }
     if (input.sshCredentialId) {
       const credential = await this.options.credentials.get(input.sshCredentialId)
       if (!credential) throw new PlatformError('SSH 凭证不存在', 400, 'bad_request')
@@ -1461,6 +1498,27 @@ export class Platform {
       return { ...result, ...(asset.sshHostKeyFingerprint ? { expected: asset.sshHostKeyFingerprint } : {}) }
     } catch (error) {
       throw new PlatformError(error instanceof Error ? error.message : '主机密钥探测失败', 502, 'ssh_unreachable')
+    }
+  }
+
+  /**
+   * 实际登录一次资产（含认证和跳板机），不执行命令，只验证凭据和连通性。
+   * operator 及以上可用；主机密钥未信任或没有可用凭证时会报错。
+   */
+  async testAssetSsh(
+    actorId: string,
+    name: string,
+  ): Promise<{ ok: true; host: string; port: number; user: string; hostKeyFingerprint?: string; jumps?: string[]; latencyMs: number }> {
+    const actor = this.requireActor(actorId)
+    if (!isOperator(actor)) throw new PlatformError('当前身份不能测试资产连接', 403, 'forbidden')
+    const asset = await this.options.assets.get(name)
+    if (!asset) throw new PlatformError('资产不存在', 404, 'not_found')
+    const started = Date.now()
+    try {
+      const result = await testAssetConnection(this.options.assets, this.options.credentials, name)
+      return { ...(result as { ok: true; host: string; port: number; user: string; hostKeyFingerprint?: string; jumps?: string[] }), latencyMs: Date.now() - started }
+    } catch (error) {
+      throw new PlatformError(describeSshConnectError(error), 502, 'ssh_unreachable')
     }
   }
 

@@ -98,6 +98,15 @@ export interface ApiKeyAuthResult {
   key: ApiKeyRecord
 }
 
+/** 管理员视角的登录失败聚合；lockedUntil 存在表示当前仍在锁定中。 */
+export interface LoginLockView {
+  username: string
+  ip?: string
+  failures: number
+  lastFailureAt: string
+  lockedUntil?: string
+}
+
 export interface AuthServiceOptions {
   sessionIdleMs?: number
   sessionAbsoluteMs?: number
@@ -392,7 +401,9 @@ export class AuthService {
     user.updatedAt = this.now().toISOString()
     await this.store.saveUser(user)
     await this.store.deleteSessionsForUser(user.id)
-    await this.recordEvent('auth.password_reset', {}, { userId: user.id })
+    // 重置密码视为管理员主动干预，一并清掉该用户的登录失败记录，避免改完密码仍被锁在门外。
+    const locksCleared = await this.store.clearLoginFailuresForUsername(user.username)
+    await this.recordEvent('auth.password_reset', {}, { userId: user.id, locksCleared })
   }
 
   async createUser(input: {
@@ -637,13 +648,48 @@ export class AuthService {
     return this.store.purgeLoginFailures(new Date(this.now().getTime() - this.failureWindowMs).toISOString())
   }
 
+  /** 管理页展示最近一个失败窗口内的所有用户名 + IP，并标出仍在锁定的条目。 */
+  async listLoginLocks(): Promise<LoginLockView[]> {
+    if (this.maxLoginFailures <= 0) return []
+    const now = this.now().getTime()
+    const since = new Date(now - this.failureWindowMs).toISOString()
+    const rows = await this.store.listLoginFailureSummaries(since)
+    return rows.map(({ attemptKey, failures, lastAt }) => {
+      const separator = attemptKey.indexOf('|')
+      const username = separator === -1 ? attemptKey : attemptKey.slice(0, separator)
+      const ip = separator === -1 ? '' : attemptKey.slice(separator + 1)
+      const lastFailure = Date.parse(lastAt)
+      const lockedUntil =
+        failures >= this.maxLoginFailures && Number.isFinite(lastFailure) && now < lastFailure + this.lockoutMs
+          ? new Date(lastFailure + this.lockoutMs).toISOString()
+          : undefined
+      return {
+        username,
+        ...(ip && ip !== '-' ? { ip } : {}),
+        failures,
+        lastFailureAt: lastAt,
+        ...(lockedUntil ? { lockedUntil } : {}),
+      }
+    })
+  }
+
+  /** 解锁按用户名清掉所有来源 IP 的失败记录；返回删除的失败条数。 */
+  async clearLoginLocks(usernameInput: string, context: AuthContext = {}): Promise<number> {
+    const username = normalizeUsername(usernameInput)
+    validateUsername(username)
+    const cleared = await this.store.clearLoginFailuresForUsername(username)
+    await this.recordEvent('auth.login_locks_cleared', context, { username, failures: cleared })
+    return cleared
+  }
+
   private failureKey(username: string, ip?: string): string {
     return `${username}|${ip ?? '-'}`
   }
 
   /**
    * 失败计数落在共享存储里，多实例共用同一把锁。
-   * 窗口内失败达到阈值后，从最近一次失败起锁定 lockoutMs；锁定期间再尝试会继续顺延。
+   * 窗口内失败达到阈值后，从最近一次失败起锁定 lockoutMs；锁定期间的尝试直接拒绝，
+   * 不再记录失败，也不会延长锁定时间。
    */
   private async assertNotLocked(key: string): Promise<void> {
     if (this.maxLoginFailures <= 0) return

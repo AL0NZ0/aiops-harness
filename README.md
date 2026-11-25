@@ -13,7 +13,7 @@ AIOps Harness 面向运维场景的轻量 AIOps 扩展层。它不 fork、不重
 - **MCP 健康巡检**：启动后立即探测，默认每 30 秒执行 `initialize` + `tools/list`；连续失败 3 次摘除该 server 的工具，恢复后自动注册。上游工具集变化时要求人工复核风险分类。
 - **账号与审计**：`AIOPS_AUTH=local` 时提供 scrypt 密码、MySQL 用户/会话/API key、HttpOnly Cookie + CSRF、角色 `viewer/operator/approver/auditor/admin`、登录限速和安全事件；不启用账号时保留本机 `x-actor-id` 自报头模式。
 - **敏感数据保护**：`data/` 下的资产、凭证、MCP headers、模型 provider key、通知 webhook URL/钉钉加签密钥用 AES-256-GCM（`enc:v1:`）加密；API、页面、事件、日志和审计不返回明文。
-- **SSH 高风险能力**：`ssh.test` 只读、`ssh.exec` 必须审批；资产绑定独立凭证，密码和私钥互斥，强制 SSH host key 指纹校验，指纹只能由管理员信任；支持最多 4 层跳板机（direct-tcpip）和 known_hosts 导入（默认预检、不覆盖已信任指纹）。
+- **SSH 高风险能力**：`ssh.test` / `ssh.read` / `ssh.logs` 只读直接执行，`ssh.exec` 必须审批；`ssh.read` 只跑精确白名单里的系统诊断命令（按 token 校验、不经过 shell），`ssh.logs` 只读资产上由管理员声明的 `sshReadPaths` 并校验软链真实路径。资产绑定独立凭证，密码和私钥互斥，强制 SSH host key 指纹校验，指纹只能由管理员信任；资产页「测试连接」会真实登录一次验证凭据、指纹和跳板机链路，不执行命令；支持最多 4 层跳板机（direct-tcpip）和 known_hosts 导入（默认预检、不覆盖已信任指纹）。
 - **模型调用增强**：provider 默认 SSE 流式输出，网页能看到节流后的实时增量；429/5xx/超时按指数退避重试；累计 token 用量并按配置单价估算成本。
 - **通用限流**：API/MCP 按客户端 IP、写请求按账号、登录按 IP 分别限流，超限 429 + `Retry-After`，进程内计数；多副本需要前置网关做全局配额。
 - **部署与备份**：多阶段 Docker 镜像、非 root + 只读根文件系统、Docker Compose、K8s 简化清单、加密备份/恢复脚本和 K8s CronJob。

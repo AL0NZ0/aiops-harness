@@ -317,6 +317,10 @@
           </label>
         </div>
         <p class="hint">密码和私钥在「密码私钥管理」创建；这里只选一个凭证，不能同时填写密码和私钥。<button type="button" class="link" data-goto-view="credentials">去创建凭证</button> 修改主机、IP 或 SSH 端口会清除已信任的主机密钥，需要重新校验。跳板机本身也必须是已信任主机密钥的完整资产，最多 4 层。</p>
+        <label id="asset-read-paths" hidden>SSH 只读日志路径（每行一个绝对路径，仅管理员可改）
+          <textarea name="sshReadPaths" rows="3" placeholder="/var/log/nginx&#10;/opt/app/logs" spellcheck="false"></textarea>
+        </label>
+        <p class="hint">只写在这里的路径可以被 <code>ssh.logs</code> 读取（按文件精确匹配或目录前缀匹配）；留空表示不开放文件日志读取。软链会先解析再校验，真实路径也必须在允许范围内。</p>
         <label>备注<textarea name="note" rows="2"></textarea></label>
         <div class="card-actions">
           <button type="submit" id="asset-submit">保存资产</button>
@@ -760,6 +764,18 @@
         <h1>API Key</h1>
         <p>给 DSH、脚本或外部 Agent 使用；token 只显示一次，列表不回显</p>
       </div>
+      <div id="key-token" class="token-panel key-token-out" hidden>
+        <div class="token-head">
+          <strong>新 API token，只显示这一次</strong>
+          <span class="token-name"></span>
+        </div>
+        <p class="token-warning">刷新或离开页面后无法再次查看，请现在复制保存。</p>
+        <div class="token-row">
+          <code class="token-value" spellcheck="false"></code>
+          <button type="button" class="ghost" data-copy-token>复制</button>
+          <button type="button" class="ghost" data-dismiss-token>我已保存</button>
+        </div>
+      </div>
       <div class="table-wrap">
         <table class="table">
           <thead>
@@ -789,7 +805,6 @@
           <label><input type="checkbox" value="tools:execute" checked /> tools:execute</label>
           <label><input type="checkbox" value="knowledge:read" /> knowledge:read</label>
         </div>
-        <p id="key-token" class="hint key-token-out" hidden></p>
         <div class="card-actions">
           <button type="submit" id="key-submit">创建 API Key</button>
         </div>
@@ -800,6 +815,18 @@
       <div class="page-head">
         <h1>用户管理</h1>
         <p>本地账号、角色和 API key；只有管理员可用</p>
+      </div>
+      <div id="user-key-token" class="token-panel key-token-out" hidden>
+        <div class="token-head">
+          <strong>新 API token，只显示这一次</strong>
+          <span class="token-name"></span>
+        </div>
+        <p class="token-warning">刷新或离开页面后无法再次查看，请现在复制保存。</p>
+        <div class="token-row">
+          <code class="token-value" spellcheck="false"></code>
+          <button type="button" class="ghost" data-copy-token>复制</button>
+          <button type="button" class="ghost" data-dismiss-token>我已保存</button>
+        </div>
       </div>
       <div class="table-wrap">
         <table class="table">
@@ -816,6 +843,23 @@
             </tr>
           </thead>
           <tbody id="user-table"></tbody>
+        </table>
+      </div>
+      <h2>登录失败与锁定</h2>
+      <p class="hint">同一用户名 + 来源 IP 在 15 分钟内失败 5 次后锁定 15 分钟；「解锁」只清失败计数，不修改密码和账号状态。管理员重置密码时会自动清除该用户的失败记录。</p>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>用户名</th>
+              <th>来源 IP</th>
+              <th>失败次数</th>
+              <th>最近失败</th>
+              <th>锁定至</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="login-lock-table"></tbody>
         </table>
       </div>
       <form id="user-form" class="composer" autocomplete="off">
@@ -839,7 +883,6 @@
           <label>Key 名称<input name="keyName" placeholder="留空=用户名-default" /></label>
         </div>
         <p class="hint">留空密码的账号只能通过 API key 使用，适合 DSH/WorkBuddy 客户端；approver、auditor、admin 必须设置密码。token 只显示一次。</p>
-        <p id="user-key-token" class="hint key-token-out" hidden></p>
         <div class="card-actions">
           <button type="submit" id="user-submit">创建用户</button>
         </div>
@@ -872,6 +915,30 @@
       </div>
       <div id="security-pager" class="pager" hidden></div>
     </section>
+      </div>
+    </div>
+    <div id="reset-password-modal" class="modal-mask" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="reset-password-title">
+        <div class="modal-head">
+          <h2 id="reset-password-title">重置密码</h2>
+          <button type="button" class="modal-close" data-close-reset aria-label="关闭">×</button>
+        </div>
+        <p id="reset-password-target" class="hint"></p>
+        <form id="reset-password-form" autocomplete="off" novalidate>
+          <label>新密码
+            <input name="newPassword" type="password" minlength="12" maxlength="256" required autocomplete="new-password" />
+          </label>
+          <label>确认新密码
+            <input name="confirmPassword" type="password" minlength="12" maxlength="256" required autocomplete="new-password" />
+          </label>
+          <label class="inline"><input type="checkbox" name="showPassword" /> 显示密码</label>
+          <p class="hint">至少 12 个字符。重置后该用户现有会话立即失效，下次登录会被要求修改密码。</p>
+          <p id="reset-password-error" class="modal-error" hidden></p>
+          <div class="modal-actions">
+            <button type="button" class="ghost" data-close-reset>取消</button>
+            <button type="submit" id="reset-password-submit">重置密码</button>
+          </div>
+        </form>
       </div>
     </div>
     <script src="/app.js"></script>

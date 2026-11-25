@@ -54,6 +54,13 @@ export interface ApiKeyRecord {
   revokedAt?: string
 }
 
+/** 登录失败按 username|IP 聚合，用于管理员查看和解锁。 */
+export interface LoginFailureSummary {
+  attemptKey: string
+  failures: number
+  lastAt: string
+}
+
 export interface SecurityEventRecord {
   id: string
   at: string
@@ -86,7 +93,11 @@ export interface AuthStore {
   recordLoginFailure(attemptKey: string, at: string): Promise<void>
   /** 按时间倒序返回窗口内的失败时间。 */
   listLoginFailures(attemptKey: string, since: string, limit: number): Promise<string[]>
+  /** 按 attemptKey 聚合窗口内的失败次数，供管理员查看锁定状态。 */
+  listLoginFailureSummaries(since: string): Promise<LoginFailureSummary[]>
   clearLoginFailures(attemptKey: string): Promise<void>
+  /** 清除某个用户名在所有来源 IP 上的失败记录；返回删除条数。 */
+  clearLoginFailuresForUsername(username: string): Promise<number>
   purgeLoginFailures(before: string): Promise<number>
 
   createApiKey(key: ApiKeyRecord): Promise<void>
@@ -222,8 +233,33 @@ export class MemoryAuthStore implements AuthStore {
       .slice(0, limit)
   }
 
+  async listLoginFailureSummaries(since: string): Promise<LoginFailureSummary[]> {
+    const summaries: LoginFailureSummary[] = []
+    for (const [attemptKey, times] of this.loginFailures) {
+      const recent = times.filter((at) => at >= since)
+      if (recent.length === 0) continue
+      summaries.push({
+        attemptKey,
+        failures: recent.length,
+        lastAt: recent.reduce((latest, at) => (at > latest ? at : latest), ''),
+      })
+    }
+    return summaries.sort((a, b) => b.lastAt.localeCompare(a.lastAt)).slice(0, 500)
+  }
+
   async clearLoginFailures(attemptKey: string): Promise<void> {
     this.loginFailures.delete(attemptKey)
+  }
+
+  async clearLoginFailuresForUsername(username: string): Promise<number> {
+    let removed = 0
+    const prefix = `${username}|`
+    for (const [attemptKey, times] of this.loginFailures) {
+      if (!attemptKey.startsWith(prefix)) continue
+      removed += times.length
+      this.loginFailures.delete(attemptKey)
+    }
+    return removed
   }
 
   async purgeLoginFailures(before: string): Promise<number> {

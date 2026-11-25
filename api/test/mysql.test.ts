@@ -104,3 +104,33 @@ test(
     }
   },
 )
+test(
+  'MySQL 登录失败按用户名聚合和清除，不误伤相似用户名',
+  { skip: config ? false : '未设置 AIOPS_DB_*，跳过 MySQL 集成测试' },
+  async () => {
+    assert.ok(config)
+    const store = new MySqlStore(config)
+    const username = `lock_${Date.now().toString(36)}`
+    const lookalike = `${username.replace('_', 'X')}|10.0.0.1`
+    try {
+      await store.init()
+      await store.recordLoginFailure(`${username}|10.0.0.1`, '2026-11-19T00:00:00.000Z')
+      await store.recordLoginFailure(`${username}|10.0.0.1`, '2026-11-19T00:00:01.000Z')
+      await store.recordLoginFailure(`${username}|-`, '2026-11-19T00:00:02.000Z')
+      await store.recordLoginFailure(lookalike, '2026-11-19T00:00:03.000Z')
+
+      const summaries = await store.listLoginFailureSummaries('2026-11-19T00:00:00.000Z')
+      const sameIp = summaries.find((item) => item.attemptKey === `${username}|10.0.0.1`)
+      assert.equal(sameIp?.failures, 2)
+      assert.equal(sameIp?.lastAt, '2026-11-19T00:00:01.000Z')
+
+      assert.equal(await store.clearLoginFailuresForUsername(username), 3)
+      const remaining = await store.listLoginFailureSummaries('2026-11-19T00:00:00.000Z')
+      assert.equal(remaining.some((item) => item.attemptKey === lookalike), true)
+    } finally {
+      await store.clearLoginFailuresForUsername(username).catch(() => undefined)
+      await store.clearLoginFailures(lookalike).catch(() => undefined)
+      await store.close()
+    }
+  },
+)

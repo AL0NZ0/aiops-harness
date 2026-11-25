@@ -2,6 +2,18 @@ import { createHash } from 'node:crypto'
 import { Client, type ClientChannel } from 'ssh2'
 import { toAssetView, type AssetRecord, type AssetStore } from './assets.ts'
 import type { CredentialStore } from './credentials.ts'
+import {
+  SSH_LOGS_MAX_LINES,
+  SSH_READ_MAX_OUTPUT,
+  SSH_READ_MAX_TIMEOUT_MS,
+  SSH_READ_TIMEOUT_MS,
+  buildLogsArgv,
+  normalizeLogLines,
+  normalizeLogPattern,
+  parseReadCommand,
+  validateLogPath,
+  validateRealPath,
+} from './ssh-read.ts'
 import type { Tool } from './types.ts'
 
 interface Target {
@@ -33,20 +45,7 @@ export function createSshTools(assets: AssetStore, credentials: CredentialStore)
         await resolveChain(assets, credentials, args.asset)
       },
       async execute(args, ctx) {
-        const chain = await resolveChain(assets, credentials, args.asset)
-        const target = chain[chain.length - 1]
-        const opened = await openChain(chain, 15_000, ctx.signal)
-        opened.close()
-        const jumps = chain.slice(0, -1).map((hop) => hop.asset.name)
-        return {
-          ok: true,
-          asset: toAssetView(target.asset),
-          host: target.host,
-          port: target.port,
-          user: target.user,
-          hostKeyFingerprint: target.asset.sshHostKeyFingerprint,
-          ...(jumps.length ? { jumps } : {}),
-        }
+        return testAssetConnection(assets, credentials, args.asset, ctx.signal)
       },
     },
     {
@@ -74,7 +73,120 @@ export function createSshTools(assets: AssetStore, credentials: CredentialStore)
         return execute(chain, command, timeout, ctx.signal)
       },
     },
+    {
+      name: 'ssh.read',
+      description:
+        '在资产上执行白名单内的只读诊断命令（负载、内存、磁盘、进程、网络、systemd、journalctl），自动执行并审计。白名单外的命令必须用 ssh.exec 走审批。',
+      risk: 'read',
+      parameters: {
+        type: 'object',
+        properties: {
+          asset: { type: 'string', description: '资产名称' },
+          command: {
+            type: 'string',
+            description:
+              '白名单内的完整命令，例如 uptime、free -m、df -h、ps aux、ss -lntp、systemctl status <unit> --no-pager、journalctl -p err -n 100 --no-pager',
+          },
+          timeoutMs: { type: 'integer', description: '连接和执行超时，1000-30000 毫秒，默认 15000' },
+        },
+        required: ['asset', 'command'],
+      },
+      async validate(args) {
+        parseReadCommand(args.command)
+        readTimeoutOf(args.timeoutMs)
+        await resolveChain(assets, credentials, args.asset)
+      },
+      async execute(args, ctx) {
+        const chain = await resolveChain(assets, credentials, args.asset)
+        const argv = parseReadCommand(args.command)
+        const timeout = readTimeoutOf(args.timeoutMs)
+        return execute(chain, argv.join(' '), timeout, ctx.signal, SSH_READ_MAX_OUTPUT)
+      },
+    },
+    {
+      name: 'ssh.logs',
+      description:
+        '读取资产上已授权的日志文件：默认 tail 最近 N 行，可用 grep 做固定字符串匹配。路径必须在资产配置的 SSH 只读路径内，只读，自动执行并审计。',
+      risk: 'read',
+      parameters: {
+        type: 'object',
+        properties: {
+          asset: { type: 'string', description: '资产名称' },
+          path: { type: 'string', description: '日志文件的绝对路径，必须在资产配置的只读路径内' },
+          lines: { type: 'integer', description: `读取行数，1-${SSH_LOGS_MAX_LINES}，默认 200` },
+          grep: { type: 'string', description: '可选：固定字符串匹配（不支持正则、空白和 shell 特殊字符）' },
+          timeoutMs: { type: 'integer', description: '连接和读取超时，1000-30000 毫秒，默认 15000' },
+        },
+        required: ['asset', 'path'],
+      },
+      async validate(args) {
+        const chain = await resolveChain(assets, credentials, args.asset)
+        const asset = chain[chain.length - 1].asset
+        validateLogPath(args.path, asset.sshReadPaths ?? [])
+        normalizeLogLines(args.lines)
+        normalizeLogPattern(args.grep)
+        readTimeoutOf(args.timeoutMs)
+      },
+      async execute(args, ctx) {
+        const chain = await resolveChain(assets, credentials, args.asset)
+        const asset = chain[chain.length - 1].asset
+        const roots = asset.sshReadPaths ?? []
+        const requested = validateLogPath(args.path, roots)
+        const lines = normalizeLogLines(args.lines)
+        const pattern = normalizeLogPattern(args.grep)
+        const timeout = readTimeoutOf(args.timeoutMs)
+        const deadline = Date.now() + timeout
+        const remaining = (): number => {
+          const left = deadline - Date.now()
+          if (left <= 0) throw new Error('SSH 日志读取超时')
+          return left
+        }
+        const opened = await openChain(chain, timeout, ctx.signal)
+        try {
+          // 软链必须先解析，真实路径仍要落在资产允许的范围内，防止借日志路径读任意文件。
+          const linked = await runCommand(opened, chain, `readlink -f -- ${requested}`, remaining(), ctx.signal, SSH_READ_MAX_OUTPUT)
+          const realPath = validateRealPath(String(linked.stdout ?? ''), roots)
+          const stat = await runCommand(opened, chain, `stat -L -c %F -- ${realPath}`, remaining(), ctx.signal, SSH_READ_MAX_OUTPUT)
+          const kind = String(stat.stdout ?? '').trim()
+          if (kind !== 'regular file' && kind !== 'regular empty file') {
+            throw new Error(`只能读取普通文件，实际类型：${kind || '未知'}`)
+          }
+          const argv = buildLogsArgv(realPath, lines, pattern)
+          const result = await runCommand(opened, chain, argv.join(' '), remaining(), ctx.signal, SSH_READ_MAX_OUTPUT)
+          return { ...result, path: realPath, lines, ...(pattern ? { grep: pattern } : {}) }
+        } finally {
+          opened.close()
+        }
+      },
+    },
   ]
+}
+
+/**
+ * 真实建立一次 SSH 连接（含认证和跳板机转发），不执行任何命令。
+ * `ssh.test` 工具和资产页「测试连接」共用；未信任主机密钥、凭证缺失
+ * 或网络不可达都会在这里报错。
+ */
+export async function testAssetConnection(
+  assets: AssetStore,
+  credentials: CredentialStore,
+  name: unknown,
+  signal?: AbortSignal,
+): Promise<Record<string, unknown>> {
+  const chain = await resolveChain(assets, credentials, name)
+  const target = chain[chain.length - 1]
+  const opened = await openChain(chain, 15_000, signal)
+  opened.close()
+  const jumps = chain.slice(0, -1).map((hop) => hop.asset.name)
+  return {
+    ok: true,
+    asset: toAssetView(target.asset),
+    host: target.host,
+    port: target.port,
+    user: target.user,
+    hostKeyFingerprint: target.asset.sshHostKeyFingerprint,
+    ...(jumps.length ? { jumps } : {}),
+  }
 }
 
 /** 解析连接链路：跳板机按顺序排在前面，目标资产在最后。 */
@@ -368,71 +480,85 @@ function connect(
   })
 }
 
-function execute(
+async function execute(
   chain: Target[],
   command: string,
   timeoutMs: number,
   signal?: AbortSignal,
+  maxOutput = MAX_OUTPUT,
 ): Promise<Record<string, unknown>> {
-  return openChain(chain, timeoutMs, signal).then(
-    (opened) =>
-      new Promise((resolve, reject) => {
-        let settled = false
-        let stdout = ''
-        let stderr = ''
-        let total = 0
-        const target = chain[chain.length - 1]
-        const jumps = chain.slice(0, -1).map((hop) => hop.asset.name)
-        const finish = (error?: Error, code = 0) => {
-          if (settled) return
-          settled = true
-          clearTimeout(timer)
-          signal?.removeEventListener('abort', onAbort)
-          opened.close()
-          if (error) reject(error)
-          else {
-            resolve({
-              asset: target.asset.name,
-              host: target.host,
-              port: target.port,
-              user: target.user,
-              command,
-              code,
-              stdout,
-              stderr,
-              ...(jumps.length ? { jumps } : {}),
-            })
-          }
-        }
-        const timer = setTimeout(() => finish(new Error('SSH 命令执行超时')), timeoutMs)
-        const onAbort = () => finish(new Error('SSH 命令已取消'))
-        if (signal?.aborted) {
-          finish(new Error('SSH 命令已取消'))
-          return
-        }
-        signal?.addEventListener('abort', onAbort, { once: true })
-        opened.conn.exec(command, (error, stream: ClientChannel) => {
-          if (error) {
-            finish(new Error(`SSH 执行失败: ${error.message}`))
-            return
-          }
-          stream.on('data', (chunk: Buffer) => {
-            if (total >= MAX_OUTPUT) return
-            const text = chunk.toString('utf8')
-            stdout += text.slice(0, MAX_OUTPUT - total)
-            total += chunk.length
-          })
-          stream.stderr.on('data', (chunk: Buffer) => {
-            if (total >= MAX_OUTPUT) return
-            const text = chunk.toString('utf8')
-            stderr += text.slice(0, MAX_OUTPUT - total)
-            total += chunk.length
-          })
-          stream.on('close', (code: number | null) => finish(undefined, code ?? 0))
-          stream.on('error', (error: Error) => finish(new Error(`SSH 通道失败: ${error.message}`)))
+  const opened = await openChain(chain, timeoutMs, signal)
+  try {
+    return await runCommand(opened, chain, command, timeoutMs, signal, maxOutput)
+  } finally {
+    opened.close()
+  }
+}
+
+/** 在已建立的连接上执行一条命令；调用方负责关闭 opened。 */
+function runCommand(
+  opened: OpenedChain,
+  chain: Target[],
+  command: string,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+  maxOutput: number,
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    let stdout = ''
+    let stderr = ''
+    let total = 0
+    const target = chain[chain.length - 1]
+    const jumps = chain.slice(0, -1).map((hop) => hop.asset.name)
+    const finish = (error?: Error, code = 0) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      if (error) reject(error)
+      else {
+        resolve({
+          asset: target.asset.name,
+          host: target.host,
+          port: target.port,
+          user: target.user,
+          command,
+          code,
+          stdout,
+          stderr,
+          ...(jumps.length ? { jumps } : {}),
         })
-      }),
-  )
+      }
+    }
+    const timer = setTimeout(() => finish(new Error('SSH 命令执行超时')), timeoutMs)
+    const onAbort = () => finish(new Error('SSH 命令已取消'))
+    if (signal?.aborted) {
+      finish(new Error('SSH 命令已取消'))
+      return
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    opened.conn.exec(command, (error, stream: ClientChannel) => {
+      if (error) {
+        finish(new Error(`SSH 执行失败: ${error.message}`))
+        return
+      }
+      stream.on('data', (chunk: Buffer) => {
+        if (total >= maxOutput) return
+        const text = chunk.toString('utf8')
+        stdout += text.slice(0, maxOutput - total)
+        total += chunk.length
+      })
+      stream.stderr.on('data', (chunk: Buffer) => {
+        if (total >= maxOutput) return
+        const text = chunk.toString('utf8')
+        stderr += text.slice(0, maxOutput - total)
+        total += chunk.length
+      })
+      stream.on('close', (code: number | null) => finish(undefined, code ?? 0))
+      stream.on('error', (error: Error) => finish(new Error(`SSH 通道失败: ${error.message}`)))
+    })
+  })
 }
 
 function textArg(args: Record<string, unknown>, key: string): string {
@@ -445,6 +571,15 @@ function timeoutOf(value: unknown): number {
   if (value === undefined) return 15_000
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 1_000 || value > 60_000) {
     throw new Error('timeoutMs 必须是 1000 到 60000 的整数')
+  }
+  return value
+}
+
+/** 只读工具的超时更短：默认 15 秒，上限 30 秒。 */
+function readTimeoutOf(value: unknown): number {
+  if (value === undefined) return SSH_READ_TIMEOUT_MS
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1_000 || value > SSH_READ_MAX_TIMEOUT_MS) {
+    throw new Error(`timeoutMs 必须是 1000 到 ${SSH_READ_MAX_TIMEOUT_MS} 的整数`)
   }
   return value
 }

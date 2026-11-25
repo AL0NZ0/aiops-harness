@@ -1,6 +1,13 @@
 import { createHash } from 'node:crypto'
 import { createPool, type Pool, type PoolConnection, type ResultSetHeader, type RowDataPacket } from 'mysql2/promise'
-import type { ApiKeyRecord, AuthStore, SecurityEventRecord, SessionRecord, UserRecord } from './auth-store.ts'
+import type {
+  ApiKeyRecord,
+  AuthStore,
+  LoginFailureSummary,
+  SecurityEventRecord,
+  SessionRecord,
+  UserRecord,
+} from './auth-store.ts'
 import type {
   ApprovalDecision,
   ApprovalQuery,
@@ -706,8 +713,34 @@ export class MySqlStore extends MySqlBase implements Store, AuthStore {
     return rows.map((row) => String(row.at))
   }
 
+  async listLoginFailureSummaries(since: string): Promise<LoginFailureSummary[]> {
+    const rows = await this.rows(
+      `SELECT attempt_key, COUNT(*) AS failures, MAX(at) AS last_at
+         FROM login_failures
+        WHERE at >= ?
+        GROUP BY attempt_key
+        ORDER BY last_at DESC
+        LIMIT 500`,
+      [since],
+    )
+    return rows.map((row) => ({
+      attemptKey: String(row.attempt_key),
+      failures: Number(row.failures),
+      lastAt: String(row.last_at),
+    }))
+  }
+
   async clearLoginFailures(attemptKey: string): Promise<void> {
     await this.run('DELETE FROM login_failures WHERE attempt_key = ?', [attemptKey])
+  }
+
+  async clearLoginFailuresForUsername(username: string): Promise<number> {
+    // 用户名只允许 [a-z0-9._-]，这里用精确前缀而不是 LIKE，避免 _ 被当成通配符。
+    const result = await this.run(
+      'DELETE FROM login_failures WHERE LEFT(attempt_key, CHAR_LENGTH(?) + 1) = CONCAT(?, \'|\')',
+      [username, username],
+    )
+    return result.affectedRows
   }
 
   async purgeLoginFailures(before: string): Promise<number> {

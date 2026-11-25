@@ -578,3 +578,51 @@ test('会话列表只暴露会话标识，可注销指定会话或其他会话',
     await ctx.close()
   }
 })
+
+test('管理员可以查看登录失败记录并解锁，普通用户无权访问', async () => {
+  const ctx = await boot()
+  try {
+    // 普通用户先拿到会话，再制造登录失败；锁定只影响登录，不影响已有会话。
+    const alice = await session(ctx.base, 'alice')
+    const admin = await ctx.auth.createUser({ username: 'root', password: PASSWORD, roles: ['admin'] })
+    ctx.users.push({ id: admin.id, name: admin.displayName, roles: admin.roles })
+    const root = await session(ctx.base, 'root')
+
+    for (let index = 0; index < 5; index += 1) {
+      assert.equal((await login(ctx.base, 'wrong password')).status, 401)
+    }
+    assert.equal((await login(ctx.base)).status, 429)
+
+    const forbidden = await fetch(`${ctx.base}/api/login-locks`, { headers: { cookie: alice.cookie } })
+    assert.equal(forbidden.status, 403)
+
+    const listed = await fetch(`${ctx.base}/api/login-locks`, { headers: { cookie: root.cookie } })
+    assert.equal(listed.status, 200)
+    const body = await listed.json() as {
+      locks: Array<{ username: string; failures: number; lockedUntil?: string }>
+    }
+    assert.equal(body.locks.length, 1)
+    assert.equal(body.locks[0]?.username, 'alice')
+    assert.ok(body.locks[0]?.lockedUntil)
+
+    const missingCsrf = await fetch(`${ctx.base}/api/login-locks/alice`, {
+      method: 'DELETE',
+      headers: { cookie: root.cookie },
+    })
+    assert.equal(missingCsrf.status, 403)
+
+    const cleared = await fetch(`${ctx.base}/api/login-locks/alice`, {
+      method: 'DELETE',
+      headers: { cookie: root.cookie, 'x-csrf-token': root.csrfToken },
+    })
+    assert.equal(cleared.status, 200)
+    assert.equal((await cleared.json() as { cleared: number }).cleared, 5)
+    assert.equal((await login(ctx.base)).status, 200)
+
+    const after = await fetch(`${ctx.base}/api/login-locks`, { headers: { cookie: root.cookie } })
+      .then((item) => item.json() as Promise<{ locks: unknown[] }>)
+    assert.deepEqual(after.locks, [])
+  } finally {
+    await ctx.close()
+  }
+})

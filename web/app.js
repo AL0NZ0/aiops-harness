@@ -148,6 +148,7 @@ const state = {
   csrfToken: '',
   me: null,
   users: [],
+  loginLocks: [],
   keys: [],
   keyToken: '',
   keyTokenLabel: '',
@@ -1585,6 +1586,7 @@ function renderAssetTable() {
       <td>${asset.sshHostKeyFingerprint ? `<span class="pill read" title="${esc(asset.sshHostKeyFingerprint)}">已信任</span>` : '<span class="pill">未信任</span>'}</td>
       <td class="row-actions">
         <button type="button" class="link" data-edit-asset="${esc(asset.name)}">编辑</button>
+        <button type="button" class="link" data-test-ssh="${esc(asset.name)}">测试连接</button>
         <button type="button" class="link" data-check-hostkey="${esc(asset.name)}">校验主机密钥</button>
         <button type="button" class="link danger-link" data-delete-asset="${esc(asset.name)}">删除</button>
       </td>
@@ -1633,6 +1635,8 @@ function renderAssets() {
   renderJumpOptions()
   const panel = $('#known-hosts-panel')
   if (panel) panel.hidden = !isAdmin()
+  const readPaths = $('#asset-read-paths')
+  if (readPaths) readPaths.hidden = !isAdmin()
   const html = state.assets.length ? state.assets.map((asset) => {
     const host = [asset.host, asset.ip].filter(Boolean).join(' · ') || '未填主机'
     const ssh = asset.sshUser
@@ -1653,6 +1657,7 @@ function renderAssets() {
         ${asset.note ? `<p class="muted">${esc(asset.note)}</p>` : ''}
         <div class="card-actions">
           <button type="button" class="ghost" data-edit-asset="${esc(asset.name)}">编辑</button>
+          <button type="button" class="ghost" data-test-ssh="${esc(asset.name)}">测试连接</button>
           <button type="button" class="ghost" data-check-hostkey="${esc(asset.name)}">校验主机密钥</button>
           <button type="button" class="danger" data-delete-asset="${esc(asset.name)}">删除</button>
         </div>
@@ -1689,6 +1694,7 @@ function fillAssetForm(asset) {
     sshUser: asset.sshUser || '',
     sshCredentialId: asset.sshCredentialId || '',
     sshJumpAsset: asset.sshJumpAsset || '',
+    sshReadPaths: (asset.sshReadPaths || []).join('\n'),
     note: asset.note || '',
   }
   for (const [name, value] of Object.entries(values)) form.elements.namedItem(name).value = value
@@ -1760,13 +1766,59 @@ function syncAccountNav() {
 
 /** 「API Key」页和「用户管理」页都要显示一次性 token，谁签发的就写进所有展示位。 */
 function paintKeyTokens() {
-  const label = state.keyTokenLabel ? `（${state.keyTokenLabel}）` : ''
-  const text = state.keyToken ? `新 token${label}（只显示这一次）：${state.keyToken}` : ''
   document.querySelectorAll('.key-token-out').forEach((node) => {
     node.hidden = !state.keyToken
-    node.textContent = text
+    const value = node.querySelector('.token-value')
+    if (value) value.textContent = state.keyToken || ''
+    const name = node.querySelector('.token-name')
+    if (name) {
+      name.textContent = state.keyTokenLabel ? `来源：${state.keyTokenLabel}` : ''
+      name.hidden = !state.keyTokenLabel
+    }
   })
 }
+
+/** 复制失败时（非 HTTPS 等）退回隐藏 textarea，保证内网 HTTP 也能用。 */
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {
+    const area = document.createElement('textarea')
+    area.value = text
+    area.style.position = 'fixed'
+    area.style.opacity = '0'
+    document.body.appendChild(area)
+    area.select()
+    let copied = false
+    try {
+      copied = document.execCommand('copy')
+    } catch {
+      copied = false
+    }
+    area.remove()
+    return copied
+  }
+}
+
+document.addEventListener('click', async (event) => {
+  const copy = event.target.closest('[data-copy-token]')
+  if (copy) {
+    if (!state.keyToken) return
+    const ok = await copyText(state.keyToken)
+    const label = copy.textContent
+    copy.textContent = ok ? '已复制' : '复制失败，请手动选中'
+    window.setTimeout(() => { copy.textContent = label }, 1800)
+    return
+  }
+  const dismiss = event.target.closest('[data-dismiss-token]')
+  if (dismiss) {
+    state.keyToken = ''
+    state.keyTokenLabel = ''
+    paintKeyTokens()
+    settingsNotice('token 已从页面清除；如果还没保存，请吊销后重新签发。')
+  }
+})
 
 function renderAccount() {
   const offline = $('#settings-offline')
@@ -1810,8 +1862,10 @@ function renderAccount() {
     `).join('')
     : '<tr><td colspan="7">还没有 API key</td></tr>')
 
+  const locks = state.loginLocks || []
+  const lockedUsers = new Set(locks.filter((lock) => lock.lockedUntil).map((lock) => lock.username))
   const users = state.users || []
-  paint('#user-table', users.map((user) => `${user.id}:${user.status}:${user.roles.join('+')}:${user.hasPassword}`).join('|'), users.length
+  paint('#user-table', users.map((user) => `${user.id}:${user.status}:${user.roles.join('+')}:${user.hasPassword}:${lockedUsers.has(user.username) ? 'locked' : ''}`).join('|'), users.length
     ? users.map((user) => `
       <tr>
         <td>${esc(user.username)}</td>
@@ -1819,7 +1873,7 @@ function renderAccount() {
         <td class="mono">${esc(user.roles.join(', '))}</td>
         <td>${esc(user.source)}</td>
         <td>${user.hasPassword ? '密码 + API key' : '仅 API key'}</td>
-        <td>${user.status === 'disabled' ? '已停用' : '正常'}</td>
+        <td>${user.status === 'disabled' ? '已停用' : lockedUsers.has(user.username) ? '正常（锁定中）' : '正常'}</td>
         <td>${user.lastLoginAt ? when(user.lastLoginAt) : '—'}</td>
         <td>
           <button type="button" class="link" data-toggle-user="${esc(user.id)}" data-status="${user.status === 'disabled' ? 'active' : 'disabled'}">${user.status === 'disabled' ? '启用' : '停用'}</button>
@@ -1829,6 +1883,19 @@ function renderAccount() {
       </tr>
     `).join('')
     : '<tr><td colspan="8">还没有本地账号</td></tr>')
+
+  paint('#login-lock-table', locks.map((lock) => `${lock.username}:${lock.ip || ''}:${lock.failures}:${lock.lockedUntil || ''}`).join('|'), locks.length
+    ? locks.map((lock) => `
+      <tr>
+        <td>${esc(lock.username)}</td>
+        <td class="mono">${esc(lock.ip || '—')}</td>
+        <td>${lock.failures}</td>
+        <td>${when(lock.lastFailureAt)}</td>
+        <td>${lock.lockedUntil ? `<span class="lock-badge">锁定至 ${when(lock.lockedUntil)}</span>` : '未锁定'}</td>
+        <td><button type="button" class="link" data-clear-locks="${esc(lock.username)}">${lock.lockedUntil ? '解锁' : '清除'}</button></td>
+      </tr>
+    `).join('')
+    : '<tr><td colspan="6">最近没有登录失败记录</td></tr>')
 
   const events = state.securityEvents || []
   paint('#security-table', events.map((event) => `${event.id}:${event.type}`).join('|'), events.length
@@ -2008,7 +2075,12 @@ async function refresh() {
         state.sessions = (await api('GET', '/api/auth/sessions')).sessions
       }
       if (state.view === 'users' && isAdmin()) {
-        state.users = (await api('GET', '/api/users')).users
+        const [usersResult, locksResult] = await Promise.all([
+          api('GET', '/api/users'),
+          api('GET', '/api/login-locks'),
+        ])
+        state.users = usersResult.users
+        state.loginLocks = locksResult.locks
       }
     }
     if (state.errorSource === 'refresh') showError('')
@@ -2531,6 +2603,10 @@ $('#asset-form').addEventListener('submit', async (event) => {
   const form = event.currentTarget
   const data = new FormData(form)
   const port = String(data.get('sshPort') || '').trim()
+  const readPaths = String(data.get('sshReadPaths') || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
   try {
     await api('POST', '/api/assets', {
       name: String(data.get('name') || '').trim(),
@@ -2544,6 +2620,7 @@ $('#asset-form').addEventListener('submit', async (event) => {
       sshUser: String(data.get('sshUser') || '').trim(),
       sshCredentialId: String(data.get('sshCredentialId') || '').trim(),
       sshJumpAsset: String(data.get('sshJumpAsset') || '').trim(),
+      ...(isAdmin() ? { sshReadPaths: readPaths } : {}),
       note: String(data.get('note') || '').trim(),
     })
     clearForm(form)
@@ -2598,42 +2675,62 @@ $('#known-hosts-apply')?.addEventListener('click', () => {
   void runKnownHostsImport(true)
 })
 
-function assetNotice(message) {
+function assetNotice(message, tone = '') {
   const node = state.view === 'asset-manage' ? $('#asset-notice-manage') : $('#asset-notice')
   if (!node) return
   node.hidden = !message
   node.textContent = message || ''
+  node.className = `notice${tone ? ` ${tone}` : ''}`
+  if (message && tone) node.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' })
 }
 
 async function onAssetAction(event) {
   const check = event.target.closest('[data-check-hostkey]')
   if (check) {
     const name = check.dataset.checkHostkey
-    assetNotice(`正在探测 ${name} 的主机密钥…`)
+    showError('')
+    assetNotice(`正在探测 ${name} 的主机密钥…`, 'progress')
     try {
       const probe = await api('POST', `/api/assets/${encodeURIComponent(name)}/ssh-host-key/probe`)
       const asset = state.assets.find((item) => item.name === name)
       const expected = asset?.sshHostKeyFingerprint || probe.expected
       if (probe.trusted) {
-        assetNotice(`主机密钥一致：${probe.fingerprint}`)
+        assetNotice(`主机密钥一致：${probe.fingerprint}`, 'ok')
         return
       }
       const message = expected
         ? `主机密钥与已信任的不一致！\n已信任：${expected}\n当前返回：${probe.fingerprint}\n\n可能是主机重装，也可能是中间人攻击。确认替换并信任新指纹？`
         : `主机返回密钥指纹：\n${probe.fingerprint}\n\n确认信任？信任后 SSH 才会连接该资产。`
       if (!window.confirm(message)) {
-        assetNotice(`未信任，当前主机指纹：${probe.fingerprint}`)
+        assetNotice(`未信任，当前主机指纹：${probe.fingerprint}`, 'error')
         return
       }
       await api('POST', `/api/assets/${encodeURIComponent(name)}/ssh-host-key/trust`, {
         fingerprint: probe.fingerprint,
         ...(expected ? { previousFingerprint: expected } : {}),
       })
-      assetNotice(`已信任主机密钥：${probe.fingerprint}`)
+      assetNotice(`已信任主机密钥：${probe.fingerprint}`, 'ok')
       await refresh()
     } catch (error) {
-      assetNotice(error.message)
-      showError(error.message)
+      assetNotice(error.message, 'error')
+    }
+    return
+  }
+  const test = event.target.closest('[data-test-ssh]')
+  if (test) {
+    const name = test.dataset.testSsh
+    test.disabled = true
+    // 连接结果只留在资产页的提示条里；顶部全局错误条会跨页面残留，这里主动清掉且不再写入。
+    showError('')
+    assetNotice(`正在连接 ${name}，最多等待 15 秒…`, 'progress')
+    try {
+      const result = await api('POST', `/api/assets/${encodeURIComponent(name)}/ssh-test`)
+      const via = result.jumps && result.jumps.length ? `经跳板机 ${result.jumps.join(' → ')}，` : ''
+      assetNotice(`连接成功：${result.user}@${result.host}:${result.port}，${via}耗时 ${result.latencyMs} ms；主机密钥 ${result.hostKeyFingerprint}`, 'ok')
+    } catch (error) {
+      assetNotice(`连接失败：${error.message}`, 'error')
+    } finally {
+      test.disabled = false
     }
     return
   }
@@ -3305,7 +3402,7 @@ $('#key-form')?.addEventListener('submit', async (event) => {
     paintKeyTokens()
     form.elements.namedItem('name').value = ''
     form.elements.namedItem('expiresAt').value = ''
-    settingsNotice('API key 已创建，请立即复制 token，页面刷新后不再显示。')
+    settingsNotice('')
     await refresh()
   } catch (error) {
     showError(error.message)
@@ -3321,7 +3418,7 @@ $('#key-table')?.addEventListener('click', async (event) => {
       state.keyToken = result.token
       state.keyTokenLabel = result.key?.name || ''
       paintKeyTokens()
-      settingsNotice('API key 已轮换，旧 token 已失效；请立即复制新 token。')
+      settingsNotice('旧 token 已立即失效。')
       await refresh()
     } catch (error) {
       showError(error.message)
@@ -3361,9 +3458,7 @@ $('#user-form')?.addEventListener('submit', async (event) => {
     state.keyTokenLabel = result.token ? (result.key?.name || keyName || '') : ''
     paintKeyTokens()
     clearForm(form)
-    settingsNotice(result.token
-      ? '用户已创建并签发 API key，请立即复制 token，页面刷新后不再显示。'
-      : '用户已创建。')
+    settingsNotice('用户已创建。')
     await refresh()
   } catch (error) {
     showError(error.message)
@@ -3392,7 +3487,7 @@ $('#user-table')?.addEventListener('click', async (event) => {
       state.keyToken = result.token
       state.keyTokenLabel = result.key?.name || issue.dataset.issueName || ''
       paintKeyTokens()
-      settingsNotice(`已为 ${issue.dataset.issueName} 签发 API key，请立即复制 token，页面刷新后不再显示。`)
+      settingsNotice(`已为 ${issue.dataset.issueName} 签发 API key。`)
       await refresh()
     } catch (error) {
       showError(error.message)
@@ -3401,11 +3496,97 @@ $('#user-table')?.addEventListener('click', async (event) => {
   }
   const reset = event.target.closest('[data-reset-user]')
   if (!reset) return
-  const password = window.prompt('输入新的初始密码（至少 12 个字符），用户下次登录后需要修改：')
-  if (!password) return
+  const user = (state.users || []).find((item) => item.id === reset.dataset.resetUser)
+  if (user) openResetPassword(user)
+})
+
+const resetModal = $('#reset-password-modal')
+const resetForm = $('#reset-password-form')
+
+function setResetPasswordError(message) {
+  const node = $('#reset-password-error')
+  if (!node) return
+  node.hidden = !message
+  node.textContent = message || ''
+}
+
+function toggleResetPasswordVisibility(visible) {
+  if (!resetForm) return
+  for (const name of ['newPassword', 'confirmPassword']) {
+    const input = resetForm.elements.namedItem(name)
+    if (input) input.type = visible ? 'text' : 'password'
+  }
+}
+
+function openResetPassword(user) {
+  if (!resetModal || !resetForm) return
+  resetForm.reset()
+  setResetPasswordError('')
+  toggleResetPasswordVisibility(false)
+  resetModal.dataset.userId = user.id
+  $('#reset-password-target').textContent = `为 ${user.displayName || user.username}（${user.username}）设置新的初始密码`
+  resetModal.hidden = false
+  window.setTimeout(() => resetForm.elements.namedItem('newPassword')?.focus(), 0)
+}
+
+function closeResetPassword() {
+  if (!resetModal || resetModal.hidden) return
+  resetModal.hidden = true
+  resetForm?.reset()
+  setResetPasswordError('')
+  toggleResetPasswordVisibility(false)
+}
+
+resetForm?.addEventListener('change', (event) => {
+  if (event.target.matches('[name="showPassword"]')) toggleResetPasswordVisibility(event.target.checked)
+})
+
+resetForm?.addEventListener('submit', async (event) => {
+  event.preventDefault()
+  const password = resetForm.elements.namedItem('newPassword').value
+  const confirm = resetForm.elements.namedItem('confirmPassword').value
+  if (password.length < 12) {
+    setResetPasswordError('新密码至少 12 个字符')
+    return
+  }
+  if (password !== confirm) {
+    setResetPasswordError('两次输入的密码不一致')
+    return
+  }
+  const userId = resetModal?.dataset.userId
+  if (!userId) return
+  setResetPasswordError('')
+  const submit = $('#reset-password-submit')
+  if (submit) submit.disabled = true
   try {
-    await api('POST', `/api/users/${encodeURIComponent(reset.dataset.resetUser)}/password`, { newPassword: password })
-    settingsNotice('密码已重置，该用户现有会话已失效。')
+    await api('POST', `/api/users/${encodeURIComponent(userId)}/password`, { newPassword: password })
+    closeResetPassword()
+    settingsNotice('密码已重置，该用户现有会话已失效，下次登录需要修改密码。')
+    await refresh()
+  } catch (error) {
+    setResetPasswordError(error.message)
+  } finally {
+    if (submit) submit.disabled = false
+  }
+})
+
+resetModal?.addEventListener('click', (event) => {
+  if (event.target === resetModal || event.target.closest('[data-close-reset]')) closeResetPassword()
+})
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && resetModal && !resetModal.hidden) closeResetPassword()
+})
+
+$('#login-lock-table')?.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-clear-locks]')
+  if (!button) return
+  const username = button.dataset.clearLocks
+  if (!window.confirm(`清除 ${username} 的登录失败记录并解锁？`)) return
+  try {
+    const result = await api('DELETE', `/api/login-locks/${encodeURIComponent(username)}`)
+    settingsNotice(`已清除 ${username} 的 ${result.cleared || 0} 条登录失败记录。`)
+    await refresh()
   } catch (error) {
     showError(error.message)
   }

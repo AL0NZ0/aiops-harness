@@ -701,6 +701,17 @@ async function resetUserPassword(ctx: Ctx): Promise<void> {
   sendJson(ctx.res, 200, { ok: true })
 }
 
+async function listLoginLocks(ctx: Ctx): Promise<void> {
+  requireAdmin(ctx)
+  sendJson(ctx.res, 200, { locks: await ctx.authService!.listLoginLocks() })
+}
+
+async function clearLoginLocks(ctx: Ctx): Promise<void> {
+  requireAdmin(ctx)
+  const cleared = await ctx.authService!.clearLoginLocks(ctx.params.id ?? '', { ip: clientIp(ctx.req) })
+  sendJson(ctx.res, 200, { ok: true, cleared })
+}
+
 async function listApiKeys(ctx: Ctx): Promise<void> {
   if (ctx.auth.method !== 'session' || !ctx.auth.user) {
     throw new PlatformError('API key 管理只能用网页会话', 403, 'forbidden')
@@ -858,6 +869,8 @@ function match(method: string, pathname: string): { params: Record<string, strin
     { method: 'GET', pattern: /^\/api\/security-events\/export$/, handle: exportSecurityEvents },
     { method: 'GET', pattern: /^\/api\/users$/, handle: listUsers },
     { method: 'POST', pattern: /^\/api\/users$/, handle: createUser },
+    { method: 'GET', pattern: /^\/api\/login-locks$/, handle: listLoginLocks },
+    { method: 'DELETE', pattern: /^\/api\/login-locks\/([^/]+)$/, handle: clearLoginLocks },
     { method: 'POST', pattern: /^\/api\/users\/([^/]+)\/password$/, handle: resetUserPassword },
     { method: 'POST', pattern: /^\/api\/users\/([^/]+)\/keys$/, handle: issueUserKey },
     { method: 'PATCH', pattern: /^\/api\/users\/([^/]+)$/, handle: updateUser },
@@ -924,6 +937,7 @@ function match(method: string, pathname: string): { params: Record<string, strin
     { method: 'GET', pattern: /^\/api\/assets$/, handle: listAssets },
     { method: 'POST', pattern: /^\/api\/assets$/, handle: saveAsset },
     { method: 'POST', pattern: /^\/api\/assets\/known-hosts\/import$/, handle: importKnownHosts },
+    { method: 'POST', pattern: /^\/api\/assets\/([^/]+)\/ssh-test$/, handle: testAssetSsh },
     { method: 'POST', pattern: /^\/api\/assets\/([^/]+)\/ssh-host-key\/probe$/, handle: probeAssetHostKey },
     { method: 'POST', pattern: /^\/api\/assets\/([^/]+)\/ssh-host-key\/trust$/, handle: trustAssetHostKey },
     { method: 'DELETE', pattern: /^\/api\/assets\/([^/]+)$/, handle: deleteAsset },
@@ -1492,11 +1506,13 @@ async function saveAsset(ctx: Ctx): Promise<void> {
     sshPassword: stringField(body, 'sshPassword'),
     sshKey: stringField(body, 'sshKey'),
     sshPassphrase: stringField(body, 'sshPassphrase'),
+    ...(body.sshReadPaths !== undefined ? { sshReadPaths: body.sshReadPaths as string[] } : {}),
   })
   await auditConfig(ctx, 'asset_saved', {
     name: asset.name,
     env: asset.env,
     tier: asset.tier,
+    sshReadPaths: asset.sshReadPaths ?? [],
   })
   sendJson(ctx.res, 200, { asset })
 }
@@ -1524,6 +1540,31 @@ async function deleteAsset(ctx: Ctx): Promise<void> {
   const deleted = await ctx.platform.deleteAsset(ctx.actorId, name)
   await auditConfig(ctx, 'asset_deleted', { name, deleted })
   sendJson(ctx.res, 200, { deleted })
+}
+
+/** 真实登录一次资产，验证凭证、主机密钥和跳板机链路；不执行命令。 */
+async function testAssetSsh(ctx: Ctx): Promise<void> {
+  const name = ctx.params.id ?? ''
+  try {
+    const result = await ctx.platform.testAssetSsh(ctx.actorId, name)
+    await auditConfig(ctx, 'asset_ssh_tested', {
+      name,
+      ok: true,
+      host: result.host,
+      port: result.port,
+      user: result.user,
+      ...(result.jumps ? { jumps: result.jumps } : {}),
+      latencyMs: result.latencyMs,
+    })
+    sendJson(ctx.res, 200, result)
+  } catch (error) {
+    await auditConfig(ctx, 'asset_ssh_tested', {
+      name,
+      ok: false,
+      error: error instanceof Error ? error.message : '未知错误',
+    })
+    throw error
+  }
 }
 
 async function probeAssetHostKey(ctx: Ctx): Promise<void> {
