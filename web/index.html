@@ -265,15 +265,48 @@
         <h1>资产列表</h1>
         <p>查看所有已登记资产、SSH 配置和凭证引用</p>
       </div>
-      <div class="toolbar">
+      <div class="toolbar asset-toolbar">
+        <input id="asset-search" type="search" placeholder="搜索名称 / 主机 / IP / 负责人 / 环境 / 凭证" autocomplete="off" spellcheck="false" />
+        <label class="muted asset-page-size">每页
+          <select id="asset-page-size">
+            <option value="20">20</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+          条
+        </label>
+        <span id="asset-list-meta" class="muted"></span>
+        <button type="button" class="ghost" id="asset-export">导出 Excel</button>
+        <button type="button" class="ghost" id="asset-import-pick">导入 Excel</button>
+        <input type="file" id="asset-import-file" accept=".xlsx,.xls" hidden />
+        <label class="muted asset-import-mode" title="不勾选时同名资产跳过，勾选后按表格内容覆盖">
+          <input type="checkbox" id="asset-import-overwrite" /> 覆盖同名资产
+        </label>
         <button type="button" class="primary" data-goto-view="asset-manage">新增资产</button>
         <button type="button" class="ghost" data-goto-view="credentials">管理密码/私钥</button>
       </div>
+      <div id="asset-bulk" class="toolbar asset-bulk" hidden>
+        <strong id="asset-selected-count"></strong>
+        <button type="button" class="ghost" data-bulk-action="ssh-test">测试连接</button>
+        <button type="button" class="ghost" data-bulk-action="host-key">校验主机密钥</button>
+        <select id="asset-bulk-credential" aria-label="批量设置凭证"></select>
+        <button type="button" class="ghost" data-bulk-action="credential">应用凭证</button>
+        <span class="bulk-jump">
+          <input id="asset-bulk-jump" placeholder="跳板机资产名，输入筛选" autocomplete="off" spellcheck="false" />
+          <div id="asset-bulk-jump-menu" class="jump-menu" hidden></div>
+          <button type="button" class="ghost" data-bulk-action="jump">应用跳板机</button>
+          <button type="button" class="ghost" data-bulk-action="jump-clear">清除</button>
+        </span>
+        <button type="button" class="danger" data-bulk-action="delete">删除</button>
+        <button type="button" class="link" id="asset-selection-clear">清除选择</button>
+      </div>
       <div id="asset-notice" class="notice" hidden></div>
+      <div id="asset-import-result" class="asset-import-result" hidden></div>
       <div class="table-wrap">
         <table class="table">
           <thead>
             <tr>
+              <th class="check-cell"><input type="checkbox" id="asset-select-all" aria-label="全选当前页" title="全选当前页" /></th>
               <th>名称</th>
               <th>主机 / IP</th>
               <th>SSH</th>
@@ -281,12 +314,16 @@
               <th>负责人</th>
               <th>等级</th>
               <th>环境</th>
+              <th>跳板机</th>
+              <th>主机密钥</th>
+              <th>状态</th>
               <th>操作</th>
             </tr>
           </thead>
           <tbody id="asset-table"></tbody>
         </table>
       </div>
+      <div id="asset-pager" class="pager" hidden></div>
     </section>
 
     <section id="view-asset-manage" class="view">
@@ -311,9 +348,10 @@
             </select>
           </label>
           <label>跳板机
-            <select name="sshJumpAsset" id="asset-jump">
-              <option value="">不使用跳板机</option>
-            </select>
+            <div class="jump-picker">
+              <input name="sshJumpAsset" id="asset-jump" placeholder="输入资产名筛选，留空表示不用" autocomplete="off" spellcheck="false" />
+              <div id="asset-jump-menu" class="jump-menu" hidden></div>
+            </div>
           </label>
         </div>
         <p class="hint">密码和私钥在「密码私钥管理」创建；这里只选一个凭证，不能同时填写密码和私钥。<button type="button" class="link" data-goto-view="credentials">去创建凭证</button> 修改主机、IP 或 SSH 端口会清除已信任的主机密钥，需要重新校验。跳板机本身也必须是已信任主机密钥的完整资产，最多 4 层。</p>

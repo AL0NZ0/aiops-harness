@@ -1,11 +1,17 @@
 import assert from 'node:assert/strict'
+import { generateKeyPairSync, randomBytes } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createServer as createNodeServer, type Server } from 'node:http'
+import { createServer as createTcpServer, type AddressInfo } from 'node:net'
+import { createRequire } from 'node:module'
 import { test } from 'node:test'
+import type { Server as SshServer } from 'ssh2'
 import os from 'node:os'
 import path from 'node:path'
+import ExcelJS from 'exceljs'
 import { LocalKnowledgeProvider } from '../../extensions/knowledge/src/index.ts'
 import { createUpstreamMcpTools, type McpServerConfig } from '../../extensions/ops-tools/src/index.ts'
+import type { AssetProbeResult } from '../src/asset-probe.ts'
 import { AssetStore } from '../src/assets.ts'
 import { createAssetTools } from '../src/asset-tools.ts'
 import { CredentialStore } from '../src/credentials.ts'
@@ -14,7 +20,7 @@ import { createSshTools } from '../src/ssh-tools.ts'
 import { createServer } from '../src/http.ts'
 import { createKnowledgeTools } from '../src/knowledge-tools.ts'
 import { Platform, type ModelResolver } from '../src/platform.ts'
-import type { ChatModel } from '../src/model.ts'
+import type { ChatMessage, ChatModel } from '../src/model.ts'
 import { ModelProviderStore, ModelRegistry } from '../src/model-providers.ts'
 import { SecretBox } from '../src/secret-box.ts'
 import { ToolBroker } from '../src/broker.ts'
@@ -22,6 +28,8 @@ import { MemoryStore } from '../src/store.ts'
 import { loadSkills } from '../src/skills.ts'
 import type { Actor, Approval, Task, Tool } from '../src/types.ts'
 import { compose } from '../src/compose.ts'
+
+const { Server: Ssh2Server } = createRequire(import.meta.url)('ssh2') as { Server: typeof SshServer }
 
 const actors: Actor[] = [
   { id: 'alice', name: 'Alice', roles: ['operator'] },
@@ -43,6 +51,7 @@ async function boot(options: {
   instanceId?: string
   approvalPollMs?: number
   allowAdminSelfApproval?: boolean
+  agentMaxSteps?: number
   securityEvent?: (type: string, detail: Record<string, unknown>) => void
 } = {}) {
   const world = {
@@ -93,10 +102,22 @@ async function boot(options: {
         return { restarted: true, namespace: pod.namespace, name: pod.workload }
       },
     },
+    {
+      name: 'demo.vm_query',
+      description: '测试用指标查询，模拟 MetricsQL 字符串字面量错误',
+      risk: 'read',
+      parameters: { type: 'object' },
+      async execute() {
+        throw new Error(
+          'unexpected response status code 422: {"status":"error","error":"error when executing query: cannot parse string literal: invalid syntax"}',
+        )
+      },
+    },
   ]
+  const assetProbes = new Map<string, AssetProbeResult>()
   const baseTools = [
     ...createKnowledgeTools(knowledge),
-    ...createAssetTools(assets),
+    ...createAssetTools(assets, { probes: assetProbes, credentials }),
     ...createSshTools(assets, credentials),
     ...demoTools,
   ]
@@ -123,6 +144,7 @@ async function boot(options: {
     mcpStore,
     assets,
     credentials,
+    assetProbes,
     store,
     tools: startup.tools,
     mcpErrors: startup.mcpErrors,
@@ -133,6 +155,7 @@ async function boot(options: {
     ...(options.instanceId ? { instanceId: options.instanceId } : {}),
     ...(options.approvalPollMs !== undefined ? { approvalPollMs: options.approvalPollMs } : {}),
     ...(options.allowAdminSelfApproval !== undefined ? { allowAdminSelfApproval: options.allowAdminSelfApproval } : {}),
+    ...(options.agentMaxSteps !== undefined ? { agentMaxSteps: options.agentMaxSteps } : {}),
     ...(options.securityEvent ? { securityEvent: options.securityEvent } : {}),
   })
   const server = createServer(platform, {
@@ -145,6 +168,8 @@ async function boot(options: {
     platform,
     world,
     store,
+    assets,
+    credentials,
     base: `http://127.0.0.1:${port}`,
     close: () => close(server),
   }
@@ -164,6 +189,57 @@ function close(server: Server): Promise<void> {
   return new Promise((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()))
   })
+}
+
+/** 起一个临时 TCP 监听地址，返回端口和关闭函数；不会连到任何真实主机。 */
+async function listenTcp(): Promise<{ port: number; close: () => Promise<void> }> {
+  const server = createTcpServer((socket) => socket.end())
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as AddressInfo).port
+  return {
+    port,
+    close: () => new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()))
+    }),
+  }
+}
+
+/**
+ * 本地临时 SSH 服务：提供主机密钥，并按需接受一路密码认证。
+ * 用来测试主机密钥探测和真实 SSH 登录测试，不会连到任何真实主机。
+ */
+async function listenSshHost(
+  login?: { user: string; password: string },
+): Promise<{ port: number; close: () => Promise<void> }> {
+  const { privateKey } = generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+    privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
+  })
+  const server = new Ssh2Server({ hostKeys: [String(privateKey)] }, (client) => {
+    // 探测连接会在认证前断开，KEX 失败是预期行为，避免冒泡成未捕获异常。
+    client.on('error', () => undefined)
+    client.on('authentication', (ctx) => {
+      if (login && ctx.method === 'password' && ctx.username === login.user && ctx.password === login.password) {
+        ctx.accept()
+      } else {
+        ctx.reject()
+      }
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as AddressInfo).port
+  return {
+    port,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  }
+}
+
+/** 拿一个刚释放的端口，用来验证「不可达」分支。 */
+async function closedTcpPort(): Promise<number> {
+  const server = await listenTcp()
+  await server.close()
+  return server.port
 }
 
 async function api(base: string, actor: string, method: string, pathname: string, body?: unknown, headers: Record<string, string> = {}) {
@@ -263,6 +339,442 @@ test('本地资产可以页面管理并被资产工具读取', async () => {
     assert.equal((await api(ctx.base, 'carol', 'POST', '/api/assets', { name: 'nope' })).status, 403)
     assert.equal((await api(ctx.base, 'alice', 'DELETE', '/api/assets/web-01')).body.deleted, true)
   } finally {
+    await ctx.close()
+  }
+})
+
+test('资产保存持久化跳板机，并拒绝不存在或自环的跳板机', async () => {
+  const ctx = await boot()
+  try {
+    for (const name of ['jump-01', 'target-01']) {
+      const created = await api(ctx.base, 'alice', 'POST', '/api/assets', { name, host: name, ip: '10.0.0.1' })
+      assert.equal(created.status, 200)
+    }
+
+    const saved = await api(ctx.base, 'alice', 'POST', '/api/assets', {
+      name: 'target-01',
+      host: 'target-01',
+      ip: '10.0.0.2',
+      sshJumpAsset: 'jump-01',
+    })
+    assert.equal(saved.status, 200)
+    assert.equal(saved.body.asset.sshJumpAsset, 'jump-01')
+
+    const listed = await api(ctx.base, 'alice', 'GET', '/api/assets')
+    const record = listed.body.assets.find((item: { name: string }) => item.name === 'target-01')
+    assert.equal(record.sshJumpAsset, 'jump-01')
+
+    const missing = await api(ctx.base, 'alice', 'POST', '/api/assets', {
+      name: 'target-01',
+      host: 'target-01',
+      sshJumpAsset: 'nope',
+    })
+    assert.equal(missing.status, 400)
+    assert.match(String(missing.body.error?.message), /跳板机资产 nope 不存在/)
+
+    const self = await api(ctx.base, 'alice', 'POST', '/api/assets', {
+      name: 'target-01',
+      host: 'target-01',
+      sshJumpAsset: 'target-01',
+    })
+    assert.equal(self.status, 400)
+    assert.match(String(self.body.error?.message), /自己作为跳板机/)
+
+    // 失败的保存不能改掉已有配置。
+    const after = await api(ctx.base, 'alice', 'GET', '/api/assets')
+    const kept = after.body.assets.find((item: { name: string }) => item.name === 'target-01')
+    assert.equal(kept.sshJumpAsset, 'jump-01')
+
+    const cleared = await api(ctx.base, 'alice', 'POST', '/api/assets', {
+      name: 'target-01',
+      host: 'target-01',
+      ip: '10.0.0.2',
+      sshJumpAsset: '',
+    })
+    assert.equal(cleared.status, 200)
+    assert.equal(cleared.body.asset.sshJumpAsset, undefined)
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('资产连接测试只对配置齐全的资产真实登录 SSH，缺配置不探测', async () => {
+  const ctx = await boot()
+  const probeServer = await listenSshHost({ user: 'tester', password: 'probe-secret' })
+  const closedPort = await closedTcpPort()
+  const fakeFingerprint = `SHA256:${Buffer.alloc(32, 7).toString('base64').replace(/=+$/, '')}`
+  try {
+    const assets: Array<[string, Record<string, unknown>]> = [
+      ['probe-up', { ip: '127.0.0.1', sshPort: probeServer.port, sshUser: 'tester', sshPassword: 'probe-secret' }],
+      ['probe-down', { ip: '127.0.0.1', sshPort: closedPort, sshUser: 'tester', sshPassword: 'probe-secret' }],
+      ['probe-nocred', { ip: '127.0.0.1', sshPort: probeServer.port, sshUser: 'tester' }],
+      ['probe-untrusted', { ip: '127.0.0.1', sshPort: probeServer.port, sshUser: 'tester', sshPassword: 'probe-secret' }],
+      ['probe-nohost', { sshUser: 'tester', sshPassword: 'probe-secret' }],
+    ]
+    for (const [name, fields] of assets) {
+      const created = await api(ctx.base, 'alice', 'POST', '/api/assets', { name, ...fields })
+      assert.equal(created.status, 200)
+    }
+    // 用服务端实际指纹信任可连接的资产；「不可达」用稳定假指纹覆盖连通性分支。
+    const probed = await ctx.platform.probeAssetHostKey('root', 'probe-up')
+    await ctx.assets.trustHostKey('probe-up', probed.fingerprint)
+    await ctx.assets.trustHostKey('probe-down', fakeFingerprint)
+    await ctx.assets.trustHostKey('probe-nocred', probed.fingerprint)
+
+    const result = await ctx.platform.probeAssets(5000)
+    const byName = Object.fromEntries(result.results.map((item) => [item.name, item]))
+    // 演示资产没有 SSH 用户，也会进缓存，但只给 blockedReason，不发起连接。
+    assert.match(String(byName['checkout-api']?.blockedReason), /没有配置 SSH 用户名/)
+    assert.equal(byName['checkout-api']?.status, 'unknown')
+    // 真实登录成功，且带延迟。
+    assert.equal(byName['probe-up'].status, 'up')
+    assert.equal(byName['probe-up'].target, `127.0.0.1:${probeServer.port}`)
+    assert.equal(typeof byName['probe-up'].latencyMs, 'number')
+    // 端口没人监听 → down。
+    assert.equal(byName['probe-down'].status, 'down')
+    assert.match(String(byName['probe-down'].error), /连接被拒绝|ECONNREFUSED|连接失败/)
+    // 缺凭证 / 缺信任指纹 / 缺主机：不发起连接，只给原因。
+    for (const name of ['probe-nocred', 'probe-untrusted', 'probe-nohost']) {
+      assert.equal(byName[name].status, 'unknown')
+      assert.equal(typeof byName[name].latencyMs, 'undefined')
+    }
+    assert.match(String(byName['probe-nocred'].blockedReason), /没有配置 SSH 凭证/)
+    assert.match(String(byName['probe-untrusted'].blockedReason), /尚未信任 SSH 主机密钥/)
+    assert.match(String(byName['probe-nohost'].blockedReason), /没有 IP 或主机名/)
+
+    const listed = await api(ctx.base, 'alice', 'GET', '/api/assets')
+    assert.equal(listed.body.probes['probe-up'].status, 'up')
+    assert.equal(listed.body.probes['probe-down'].status, 'down')
+    assert.match(String(listed.body.probes['probe-nocred'].blockedReason), /没有配置 SSH 凭证/)
+
+    // 模型从 asset.list 拿到的就是同一份状态：只有 up 且 configured 的才算可连接。
+    const listedByTool = await api(ctx.base, 'alice', 'POST', '/api/tool-calls', {
+      tool: 'asset.list',
+      args: {},
+    }, { 'x-internal-token': 'test-token' })
+    assert.equal(listedByTool.body.status, 'ok')
+    const views = Object.fromEntries(
+      (listedByTool.body.result.assets as Array<{ name: string; ssh: Record<string, unknown> }>).map((item) => [item.name, item.ssh]),
+    )
+    assert.equal(views['probe-up'].configured, true)
+    assert.equal(views['probe-up'].status, 'up')
+    assert.equal(views['probe-down'].status, 'down')
+    assert.equal(views['probe-nocred'].configured, false)
+    assert.match(String(views['probe-nocred'].blockedReason), /没有配置 SSH 凭证/)
+    assert.equal(views['probe-untrusted'].configured, false)
+
+    // 资产删除后，缓存里的旧结果也要一起清掉，页面不会显示幽灵状态。
+    await ctx.assets.remove('probe-down')
+    await ctx.platform.probeAssets(5000)
+    const probes = ctx.platform.listAssetProbes('alice')
+    assert.equal(probes['probe-down'], undefined)
+    assert.equal(probes['probe-up'].status, 'up')
+  } finally {
+    await probeServer.close()
+    await ctx.close()
+  }
+})
+
+test('资产批量删除和批量设置凭证逐条返回结果', async () => {
+  const ctx = await boot()
+  try {
+    const credential = await api(ctx.base, 'alice', 'POST', '/api/credentials', {
+      name: 'batch-key',
+      type: 'password',
+      password: 'batch-secret',
+    })
+    assert.equal(credential.status, 200)
+    const credentialId = credential.body.credential.id as string
+
+    for (const name of ['jump-01', 'target-a', 'target-b']) {
+      const created = await api(ctx.base, 'alice', 'POST', '/api/assets', {
+        name,
+        host: name,
+        ip: '10.0.0.1',
+      })
+      assert.equal(created.status, 200)
+    }
+    const linked = await api(ctx.base, 'alice', 'POST', '/api/assets', {
+      name: 'target-a',
+      host: 'target-a',
+      ip: '10.0.0.1',
+      sshJumpAsset: 'jump-01',
+    })
+    assert.equal(linked.status, 200)
+
+    const assigned = await api(ctx.base, 'alice', 'POST', '/api/assets/batch/credential', {
+      names: ['target-a', 'target-b', 'ghost'],
+      credentialId,
+    })
+    assert.equal(assigned.status, 200)
+    assert.equal(assigned.body.updated.length, 2)
+    assert.equal(assigned.body.failed.length, 1)
+    assert.equal(assigned.body.failed[0].name, 'ghost')
+    const updatedA = assigned.body.updated.find((item: { name: string }) => item.name === 'target-a')
+    assert.equal(updatedA.sshCredentialId, credentialId)
+    assert.equal(updatedA.sshJumpAsset, 'jump-01')
+    assert.equal(updatedA.host, 'target-a')
+
+    const missingCredential = await api(ctx.base, 'alice', 'POST', '/api/assets/batch/credential', {
+      names: ['target-a'],
+      credentialId: 'cred_missing',
+    })
+    assert.equal(missingCredential.status, 400)
+    assert.match(String(missingCredential.body.error?.message), /SSH 凭证不存在/)
+
+    const cleared = await api(ctx.base, 'alice', 'POST', '/api/assets/batch/credential', {
+      names: ['target-b'],
+      credentialId: '',
+    })
+    assert.equal(cleared.status, 200)
+    assert.equal(cleared.body.updated[0].sshCredentialId, undefined)
+
+    assert.equal((await api(ctx.base, 'carol', 'POST', '/api/assets/batch/delete', { names: ['target-b'] })).status, 403)
+
+    const removed = await api(ctx.base, 'alice', 'POST', '/api/assets/batch/delete', {
+      names: ['jump-01', 'target-b', 'ghost'],
+    })
+    assert.equal(removed.status, 200)
+    assert.deepEqual(removed.body.deleted, ['target-b'])
+    assert.deepEqual(removed.body.failed.map((item: { name: string }) => item.name), ['jump-01', 'ghost'])
+    assert.match(String(removed.body.failed[0].error), /跳板机/)
+
+    const after = await api(ctx.base, 'alice', 'GET', '/api/assets')
+    const names = after.body.assets.map((item: { name: string }) => item.name)
+    assert.ok(names.includes('jump-01'))
+    assert.ok(!names.includes('target-b'))
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('资产批量设置跳板机逐条校验并支持解除', async () => {
+  const ctx = await boot()
+  try {
+    for (const name of ['jump-01', 'jump-02', 'target-a', 'target-b']) {
+      const created = await api(ctx.base, 'alice', 'POST', '/api/assets', { name, host: name, ip: '10.0.0.1' })
+      assert.equal(created.status, 200)
+    }
+
+    const assigned = await api(ctx.base, 'alice', 'POST', '/api/assets/batch/jump', {
+      names: ['target-a', 'target-b', 'jump-02', 'ghost'],
+      jumpAsset: 'jump-01',
+    })
+    assert.equal(assigned.status, 200)
+    assert.equal(assigned.body.updated.length, 3)
+    assert.equal(assigned.body.failed.length, 1)
+    assert.equal(assigned.body.failed[0].name, 'ghost')
+    const targetA = assigned.body.updated.find((item: { name: string }) => item.name === 'target-a')
+    assert.equal(targetA.sshJumpAsset, 'jump-01')
+    assert.equal(targetA.host, 'target-a')
+
+    const missing = await api(ctx.base, 'alice', 'POST', '/api/assets/batch/jump', {
+      names: ['target-a'],
+      jumpAsset: 'ghost-jump',
+    })
+    assert.equal(missing.status, 400)
+    assert.match(String(missing.body.error?.message), /跳板机资产不存在/)
+
+    const self = await api(ctx.base, 'alice', 'POST', '/api/assets/batch/jump', {
+      names: ['jump-01'],
+      jumpAsset: 'jump-01',
+    })
+    assert.equal(self.status, 200)
+    assert.equal(self.body.updated.length, 0)
+    assert.match(String(self.body.failed[0].error), /自己作为跳板机/)
+
+    const cleared = await api(ctx.base, 'alice', 'POST', '/api/assets/batch/jump', {
+      names: ['target-a'],
+      jumpAsset: '',
+    })
+    assert.equal(cleared.status, 200)
+    assert.equal(cleared.body.updated[0].sshJumpAsset, undefined)
+
+    assert.equal(
+      (await api(ctx.base, 'carol', 'POST', '/api/assets/batch/jump', { names: ['target-b'], jumpAsset: 'jump-01' })).status,
+      403,
+    )
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('资产表格导出空平台即模板，导入逐行记录成功和失败', async () => {
+  const ctx = await boot()
+  try {
+    // boot 默认带两条演示资产，先清掉，验证空平台导出的是模板。
+    await ctx.assets.remove('checkout-api')
+    await ctx.assets.remove('payments-api')
+    const empty = await fetch(`${ctx.base}/api/assets/export`, { headers: { 'x-actor-id': 'alice' } })
+    assert.equal(empty.status, 200)
+    assert.match(String(empty.headers.get('content-type')), /spreadsheetml/)
+    const emptyBuffer = Buffer.from(await empty.arrayBuffer())
+    assert.equal(emptyBuffer.subarray(0, 2).toString(), 'PK')
+    const emptyBook = new ExcelJS.Workbook()
+    await emptyBook.xlsx.load(emptyBuffer as unknown as ArrayBuffer)
+    const emptySheet = emptyBook.worksheets[0]!
+    const header = ((emptySheet.getRow(1).values as unknown[]).slice(1)).map((cell) => String(cell ?? ''))
+    assert.deepEqual(header, ['名称', '主机', 'IP', '环境', '负责人', '等级', '仓库', '备注', 'SSH端口', 'SSH用户', '凭证名称', '跳板机'])
+    assert.equal(emptySheet.rowCount, 1)
+    assert.equal((await fetch(`${ctx.base}/api/assets/export`, { headers: { 'x-actor-id': 'carol' } })).status, 403)
+
+    const credential = await api(ctx.base, 'alice', 'POST', '/api/credentials', {
+      name: 'jump-key',
+      type: 'password',
+      password: 'batch-secret',
+    })
+    assert.equal(credential.status, 200)
+
+    const build = async (rows: unknown[][]): Promise<Buffer> => {
+      const book = new ExcelJS.Workbook()
+      const sheet = book.addWorksheet('资产')
+      sheet.addRow(header)
+      for (const row of rows) sheet.addRow(row)
+      return Buffer.from(await book.xlsx.writeBuffer())
+    }
+    const rows: unknown[][] = [
+      ['jump-01', 'jump-01', '10.0.0.9', 'prod', '老大', 'critical', '', '跳板', 22, 'root', '', ''],
+      ['target-a', '', '10.0.0.10', 'prod', '', '', '', '', '', 'ops', 'jump-key', 'jump-01'],
+      ['target-a', '', '10.0.0.11', 'prod', '', '', '', '', '', '', '', ''],
+      ['target-b', '', '10.0.0.12', '', '', '', '', '', '', 'ops', 'missing-key', ''],
+      ['target-c', '', '10.0.0.13', '', '', '', '', '', 70000, '', '', ''],
+      ['target-d', '', '10.0.0.14', '', '', '', '', '', '', '', '', 'ghost-jump'],
+      ['', '', '', '', '', '', '', '', '', '', '', ''],
+    ]
+
+    const imported = await api(ctx.base, 'alice', 'POST', '/api/assets/import', {
+      file: (await build(rows)).toString('base64'),
+      mode: 'skip',
+    })
+    assert.equal(imported.status, 200)
+    assert.equal(imported.body.result.total, 6)
+    assert.equal(imported.body.result.imported, 2)
+    assert.equal(imported.body.result.failed, 4)
+    const failures = imported.body.result.entries.filter((item: { status: string }) => item.status === 'failed')
+    assert.match(String(failures[0].error), /文件中重复/)
+    assert.match(String(failures[1].error), /凭证不存在/)
+    assert.match(String(failures[2].error), /SSH端口/)
+    assert.match(String(failures[3].error), /跳板机资产不存在/)
+
+    const listed = await api(ctx.base, 'alice', 'GET', '/api/assets')
+    const jump = listed.body.assets.find((item: { name: string }) => item.name === 'jump-01')
+    assert.equal(jump.note, '跳板')
+    assert.equal(jump.sshUser, 'root')
+    assert.equal(jump.sshPort, 22)
+    const target = listed.body.assets.find((item: { name: string }) => item.name === 'target-a')
+    assert.equal(target.sshJumpAsset, 'jump-01')
+    assert.equal(target.sshCredentialId, credential.body.credential.id)
+
+    // 覆盖模式：同名资产按行更新，主机密钥指纹不随表格变化。
+    const fingerprint = `SHA256:${Buffer.alloc(32, 9).toString('base64').replace(/=+$/, '')}`
+    await ctx.assets.trustHostKey('jump-01', fingerprint)
+    rows[0]![7] = '跳板-新'
+    const overwritten = await api(ctx.base, 'alice', 'POST', '/api/assets/import', {
+      file: (await build(rows)).toString('base64'),
+      mode: 'overwrite',
+    })
+    assert.equal(overwritten.status, 200)
+    assert.equal(overwritten.body.result.mode, 'overwrite')
+    assert.equal(overwritten.body.result.imported, 2)
+    const after = await api(ctx.base, 'alice', 'GET', '/api/assets')
+    const renamed = after.body.assets.find((item: { name: string }) => item.name === 'jump-01')
+    assert.equal(renamed.note, '跳板-新')
+    assert.equal(renamed.sshHostKeyFingerprint, fingerprint)
+
+    // 导入后再次导出能还原凭证名和跳板机，说明表格字段可往返。
+    const exported = await fetch(`${ctx.base}/api/assets/export`, { headers: { 'x-actor-id': 'alice' } })
+    const exportedBook = new ExcelJS.Workbook()
+    await exportedBook.xlsx.load(Buffer.from(await exported.arrayBuffer()) as unknown as ArrayBuffer)
+    const exportedSheet = exportedBook.worksheets[0]!
+    const exportedRows: Array<Record<string, string>> = []
+    exportedSheet.eachRow((row, rowNumber) => {
+      if (rowNumber === 1) return
+      const values = (row.values as unknown[]).slice(1)
+      const record: Record<string, string> = {}
+      header.forEach((key, index) => { record[key] = String(values[index] ?? '') })
+      exportedRows.push(record)
+    })
+    const exportedTarget = exportedRows.find((item) => item['名称'] === 'target-a')
+    assert.equal(exportedTarget?.['凭证名称'], 'jump-key')
+    assert.equal(exportedTarget?.['跳板机'], 'jump-01')
+    assert.equal(exportedRows.find((item) => item['名称'] === 'jump-01')?.['备注'], '跳板-新')
+
+    assert.equal(
+      (await api(ctx.base, 'carol', 'POST', '/api/assets/import', { file: (await build(rows)).toString('base64') })).status,
+      403,
+    )
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('资产批量 SSH 测试和主机密钥校验逐条返回错误', async () => {
+  const ctx = await boot()
+  try {
+    const created = await api(ctx.base, 'alice', 'POST', '/api/assets', {
+      name: 'dead-01',
+      ip: '127.0.0.1',
+      sshPort: await closedTcpPort(),
+      sshUser: 'probe',
+    })
+    assert.equal(created.status, 200)
+
+    const tested = await api(ctx.base, 'alice', 'POST', '/api/assets/batch/ssh-test', {
+      names: ['dead-01', 'ghost'],
+    })
+    assert.equal(tested.status, 200)
+    assert.equal(tested.body.results.length, 2)
+    for (const item of tested.body.results) {
+      assert.equal(item.ok, false)
+      assert.equal(typeof item.error, 'string')
+      assert.ok(item.error.length > 0)
+    }
+
+    const probed = await api(ctx.base, 'alice', 'POST', '/api/assets/batch/host-key', {
+      names: ['dead-01'],
+    })
+    assert.equal(probed.status, 200)
+    assert.equal(probed.body.results[0].name, 'dead-01')
+    assert.equal(probed.body.results[0].ok, false)
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('管理员批量信任主机密钥只补空白，已有指纹跳过不覆盖', async () => {
+  const ctx = await boot()
+  const ssh = await listenSshHost()
+  try {
+    for (const name of ['trust-a', 'trust-b']) {
+      const created = await api(ctx.base, 'alice', 'POST', '/api/assets', {
+        name,
+        ip: '127.0.0.1',
+        sshPort: ssh.port,
+        sshUser: 'tester',
+      })
+      assert.equal(created.status, 200)
+    }
+    const known = `SHA256:${randomBytes(32).toString('base64').replace(/=+$/, '')}`
+    await ctx.assets.trustHostKey('trust-b', known)
+
+    const denied = await api(ctx.base, 'alice', 'POST', '/api/assets/batch/host-key/trust', {
+      names: ['trust-a'],
+    })
+    assert.equal(denied.status, 403)
+
+    const trusted = await api(ctx.base, 'root', 'POST', '/api/assets/batch/host-key/trust', {
+      names: ['trust-a', 'trust-b', 'ghost'],
+    })
+    assert.equal(trusted.status, 200)
+    assert.deepEqual(trusted.body.trusted, ['trust-a'])
+    assert.equal(trusted.body.skipped[0].name, 'trust-b')
+    assert.equal(trusted.body.failed[0].name, 'ghost')
+
+    const list = await ctx.assets.list()
+    assert.match(list.find((item) => item.name === 'trust-a')?.sshHostKeyFingerprint ?? '', /^SHA256:/)
+    assert.equal(list.find((item) => item.name === 'trust-b')?.sshHostKeyFingerprint, known)
+  } finally {
+    await ssh.close()
     await ctx.close()
   }
 })
@@ -724,6 +1236,66 @@ test('模型任务的变更也等审批，通过后继续同一条循环', async
     const events = (await api(ctx.base, 'alice', 'GET', `/api/tasks/${taskId}/events`)).body.events
     const types = events.map((event: { type: string }) => event.type)
     assert.ok(types.filter((type: string) => type === 'model.step').length >= 2)
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('模型步骤上限支持超过 30 轮', async () => {
+  const steps = Array.from({ length: 35 }, () => ({
+    content: '',
+    calls: [{ name: 'demo_list_pods', args: '{}' }],
+  }))
+  const model = scriptedModel(...steps, { content: '35 轮工具调用后完成' })
+  const ctx = await boot({ model, agentMaxSteps: 40 })
+  try {
+    const created = await api(ctx.base, 'alice', 'POST', '/api/tasks', {
+      prompt: '连续查询 Pod 列表',
+    })
+    const task = await ctx.platform.waitUntil(created.body.task.id, (item) => item.status === 'succeeded')
+    assert.match(task.result ?? '', /35 轮工具调用后完成/)
+    const events = (await api(ctx.base, 'alice', 'GET', `/api/tasks/${task.id}/events`)).body.events
+    const stepCount = events.filter((event: { type: string }) => event.type === 'model.step').length
+    assert.equal(stepCount, 36)
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('MetricsQL 字符串字面量错误会附带转义提示', async () => {
+  const seen: ChatMessage[][] = []
+  let calls = 0
+  const model: ChatModel = {
+    async complete(input) {
+      seen.push(input.messages.map((message) => ({ ...message })))
+      calls += 1
+      if (calls === 1) {
+        return {
+          content: '',
+          toolCalls: [
+            {
+              id: 'call_vm',
+              type: 'function' as const,
+              function: { name: 'demo_vm_query', arguments: '{}' },
+            },
+          ],
+        }
+      }
+      return { content: '已按提示修正查询', toolCalls: [] }
+    },
+  }
+  const ctx = await boot({ model })
+  try {
+    const created = await api(ctx.base, 'alice', 'POST', '/api/tasks', {
+      prompt: '查询 node_filesystem_avail_bytes',
+    })
+    await ctx.platform.waitUntil(created.body.task.id, (item) => item.status === 'succeeded')
+    const toolMessage = seen[1]?.find((message) => message.role === 'tool')
+    const content = String(toolMessage?.content ?? '')
+    assert.ok(content.includes('cannot parse string literal'))
+    assert.ok(content.includes('MetricsQL 语法提示'))
+    assert.ok(content.includes('instance=~".*17\\\\.(10|11|12)"'))
+    assert.ok(content.includes('[.]'))
   } finally {
     await ctx.close()
   }

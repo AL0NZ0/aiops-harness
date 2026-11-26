@@ -30,6 +30,7 @@ description: 排查 Kubernetes 工作负载异常（CrashLoopBackOff、Pending�
 6. 监控联动（`mcp.vm.*`）：
    - 用 `query_range` 看 CPU、内存、重启次数、容器 throttling、节点压力，时间窗覆盖故障前后（15m/1h/6h）。
    - 查询限定 container/pod/node label，不要拉全集群序列；只引用明显异常的序列，写清数值和单位。
+   - 正则里点号写成 `\\.`（如 `{instance=~".*17\\.(10|11|12)"}`）或用 `[.]`，不要写 `\.`；MetricsQL 双引号字符串按 Go 规则解析，写错会返回 `cannot parse string literal`。
 7. 不要为了「归属」额外调 `asset.get`：资产没登记不代表排查有问题，结论只写对象和证据。
 
 ## 结论要求

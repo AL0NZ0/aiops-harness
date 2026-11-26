@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { randomBytes } from 'node:crypto'
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -133,6 +134,24 @@ test('加密模式下 JSON 损坏或密钥不匹配时不得清空数据', async
     await writeFile(file, '{not json')
     await assert.rejects(() => new McpServerStore(file, [], SecretBox.fromKey(KEY)).list(), SyntaxError)
     assert.equal(await readFile(file, 'utf8'), '{not json')
+  } finally {
+    await cleanup()
+  }
+})
+test('资产并发写入串行落盘，临时文件不会互相覆盖', async () => {
+  const { dir, cleanup } = await tempDir()
+  try {
+    const file = path.join(dir, 'assets.json')
+    const store = new AssetStore(file, [])
+    const names = Array.from({ length: 24 }, (_, index) => `host-${index}`)
+    await Promise.all(names.map((name) => store.upsert({ name, host: '127.0.0.1' })))
+    await Promise.all(names.map((name) => store.trustHostKey(
+      name,
+      `SHA256:${randomBytes(32).toString('base64').replace(/=+$/, '')}`,
+    )))
+    const list = await new AssetStore(file, []).list()
+    assert.equal(list.length, 24)
+    assert.equal(list.filter((item) => item.sshHostKeyFingerprint).length, 24)
   } finally {
     await cleanup()
   }

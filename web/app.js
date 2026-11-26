@@ -197,6 +197,12 @@ const state = {
   kbEditing: false,
   kbCreating: false,
   assets: [],
+  probes: {},
+  assetQuery: '',
+  assetPage: 1,
+  assetPageSize: 20,
+  assetSelected: new Set(),
+  assetBulkBusy: false,
   credentials: [],
   tools: [],
   toolPolicies: [],
@@ -233,6 +239,7 @@ const state = {
   features: {},
   skillOptions: null,
   inflight: false,
+  inflightPromise: null,
 }
 
 const $ = (selector) => document.querySelector(selector)
@@ -1608,9 +1615,120 @@ function sshSummary(asset) {
   return `${asset.sshUser}@${asset.ip || asset.host || '?'}${asset.sshPort ? `:${asset.sshPort}` : ''}`
 }
 
+function assetMatchesQuery(asset, query) {
+  const hay = [
+    asset.name,
+    asset.host,
+    asset.ip,
+    asset.owner,
+    asset.env,
+    asset.tier,
+    asset.repo,
+    asset.note,
+    asset.sshJumpAsset,
+    credentialLabel(asset),
+  ].filter(Boolean).join(' ').toLowerCase()
+  return hay.includes(query)
+}
+
+function visibleAssets() {
+  const query = state.assetQuery.trim().toLowerCase()
+  return query ? state.assets.filter((asset) => assetMatchesQuery(asset, query)) : state.assets
+}
+
+function currentAssetPage() {
+  const start = (state.assetPage - 1) * state.assetPageSize
+  return visibleAssets().slice(start, start + state.assetPageSize)
+}
+
+/**
+ * 状态来自后台真实 SSH 登录测试；缺主机、SSH 用户、凭证或信任指纹的资产
+ * 不会发起连接，直接显示缺什么。
+ */
+function probePill(asset) {
+  const probe = state.probes[asset.name]
+  if (!asset.host && !asset.ip) {
+    return '<span class="pill" title="资产没有主机或 IP，无法连接">缺少主机</span>'
+  }
+  if (!asset.sshUser) {
+    return '<span class="pill" title="没有配置 SSH 用户名，不参与连接测试">缺 SSH 用户</span>'
+  }
+  if (!asset.sshHostKeyFingerprint) {
+    return '<span class="pill" title="尚未信任主机密钥，不参与连接测试">未校验</span>'
+  }
+  if (probe && probe.blockedReason) {
+    return `<span class="pill" title="${esc(probe.blockedReason)}">未配置凭证</span>`
+  }
+  if (!probe) return '<span class="pill pending" title="等待后台 SSH 连接测试">等待探测</span>'
+  const when = probe.checkedAt
+    ? new Date(probe.checkedAt).toLocaleString('zh-CN', { hour12: false })
+    : ''
+  if (probe.status === 'up') {
+    return `<span class="pill read" title="${esc(probe.target || '')} · ${esc(when)}">可连接 ${esc(String(probe.latencyMs ?? '-'))}ms</span>`
+  }
+  if (probe.status === 'down') {
+    return `<span class="pill failed" title="${esc(probe.error || '连接失败')} · ${esc(when)}">不可达</span>`
+  }
+  return `<span class="pill" title="${esc(probe.error || '')}">未知</span>`
+}
+
+function renderBulkCredentialOptions() {
+  const select = $('#asset-bulk-credential')
+  if (!select) return
+  const signature = state.credentials.map((item) => `${item.id}:${item.name}:${item.type}`).join('|')
+  if (select.dataset.signature === signature) return
+  const current = select.value
+  select.innerHTML = '<option value="">选择凭证…</option>'
+    + state.credentials.map((item) => `<option value="${esc(item.id)}">${esc(item.name)}（${item.type === 'key' ? '私钥' : '密码'}）</option>`).join('')
+    + '<option value="__clear__">清除凭证引用</option>'
+  select.dataset.signature = signature
+  if ([...select.options].some((option) => option.value === current)) select.value = current
+}
+
+function renderAssetBulk() {
+  const bar = $('#asset-bulk')
+  if (!bar) return
+  const count = state.assetSelected.size
+  const label = $('#asset-selected-count')
+  if (label) label.textContent = count ? `已选 ${count} 个资产` : ''
+  bar.hidden = count === 0
+  if (!count) return
+  renderBulkCredentialOptions()
+  bar.querySelectorAll('button').forEach((button) => { button.disabled = state.assetBulkBusy })
+  const select = $('#asset-bulk-credential')
+  if (select) select.disabled = state.assetBulkBusy
+}
+
+function renderAssetPager(total, pages) {
+  const node = $('#asset-pager')
+  if (!node) return
+  if (pages <= 1) {
+    node.hidden = true
+    node.dataset.paint = ''
+    node.innerHTML = ''
+    return
+  }
+  node.hidden = false
+  paint('#asset-pager', `${state.assetPage}:${pages}:${total}:${state.assetPageSize}`, `
+    <button type="button" class="ghost" data-asset-page="${state.assetPage - 1}" ${state.assetPage <= 1 ? 'disabled' : ''}>上一页</button>
+    <span class="muted">第 ${state.assetPage}/${pages} 页 · 共 ${total} 条</span>
+    <button type="button" class="ghost" data-asset-page="${state.assetPage + 1}" ${state.assetPage >= pages ? 'disabled' : ''}>下一页</button>
+  `)
+}
+
 function renderAssetTable() {
-  const rows = state.assets.length ? state.assets.map((asset) => `
+  const all = state.assets
+  const existing = new Set(all.map((asset) => asset.name))
+  for (const name of [...state.assetSelected]) {
+    if (!existing.has(name)) state.assetSelected.delete(name)
+  }
+  const filtered = visibleAssets()
+  const pages = Math.max(1, Math.ceil(filtered.length / state.assetPageSize))
+  state.assetPage = Math.min(Math.max(1, state.assetPage), pages)
+  const pageAssets = currentAssetPage()
+  const rows = pageAssets.length ? pageAssets.map((asset) => `
     <tr>
+      <td class="check-cell"><input type="checkbox" data-select-asset="${esc(asset.name)}" ${state.assetSelected.has(asset.name) ? 'checked' : ''} aria-label="选择 ${esc(asset.name)}" /></td>
       <td><strong>${esc(asset.name)}</strong></td>
       <td>${esc([asset.host, asset.ip].filter(Boolean).join(' / ') || '-')}</td>
       <td>${esc(sshSummary(asset))}</td>
@@ -1618,7 +1736,9 @@ function renderAssetTable() {
       <td>${esc(asset.owner || '-')}</td>
       <td>${esc(asset.tier || '-')}</td>
       <td>${esc(asset.env || '-')}</td>
+      <td>${esc(asset.sshJumpAsset || '-')}</td>
       <td>${asset.sshHostKeyFingerprint ? `<span class="pill read" title="${esc(asset.sshHostKeyFingerprint)}">已信任</span>` : '<span class="pill">未信任</span>'}</td>
+      <td>${probePill(asset)}</td>
       <td class="row-actions">
         <button type="button" class="link" data-edit-asset="${esc(asset.name)}">编辑</button>
         <button type="button" class="link" data-test-ssh="${esc(asset.name)}">测试连接</button>
@@ -1626,29 +1746,134 @@ function renderAssetTable() {
         <button type="button" class="link danger-link" data-delete-asset="${esc(asset.name)}">删除</button>
       </td>
     </tr>
-  `).join('') : '<tr><td colspan="9" class="empty">还没有资产。点「新增资产」录入。</td></tr>'
-  paint('#asset-table', state.assets.map((asset) => JSON.stringify(asset)).join('|') + ':' + state.credentials.map((item) => JSON.stringify(item)).join('|') || 'empty', rows)
+  `).join('') : `<tr><td colspan="12" class="empty">${all.length ? '没有匹配的资产，换个关键字试试。' : '还没有资产。点「新增资产」录入。'}</td></tr>`
+  const credentialsSignature = state.credentials.map((item) => `${item.id}:${item.name}:${item.type}`).join('|')
+  const key = [
+    pageAssets.map((asset) => JSON.stringify(asset)).join('|'),
+    [...state.assetSelected].sort().join(','),
+    JSON.stringify(state.probes),
+    state.assetQuery,
+    state.assetPage,
+    state.assetPageSize,
+    credentialsSignature,
+  ].join('::')
+  paint('#asset-table', key || 'empty', rows)
+  const meta = $('#asset-list-meta')
+  if (meta) {
+    meta.textContent = filtered.length === all.length
+      ? `共 ${all.length} 个资产`
+      : `匹配 ${filtered.length} / ${all.length} 个资产`
+  }
+  const selectAll = $('#asset-select-all')
+  if (selectAll) {
+    const chosen = pageAssets.filter((asset) => state.assetSelected.has(asset.name)).length
+    selectAll.checked = pageAssets.length > 0 && chosen === pageAssets.length
+    selectAll.indeterminate = chosen > 0 && chosen < pageAssets.length
+    selectAll.disabled = state.assetBulkBusy || pageAssets.length === 0
+  }
+  renderAssetBulk()
+  renderAssetPager(filtered.length, pages)
 }
 
-function renderJumpOptions() {
-  const select = $('#asset-jump')
-  if (!select) return
-  const current = select.value
-  select.innerHTML = `<option value="">不使用跳板机</option>${state.assets
-    .map((asset) => `<option value="${esc(asset.name)}">${esc(asset.name)}</option>`)
-    .join('')}`
-  select.value = state.assets.some((item) => item.name === current) ? current : ''
+/**
+ * 跳板机用可筛选输入框 + 自绘候选列表：资产多时打字过滤，避免超长原生下拉滚不到末尾。
+ * 资产编辑和批量设置跳板机共用同一套交互。
+ */
+function setupAssetJumpPicker(inputSelector, menuSelector) {
+  const input = $(inputSelector)
+  const menu = $(menuSelector)
+  if (!input || !menu) return null
+  const picker = { input, menu, suppressed: false }
+
+  const close = () => {
+    menu.hidden = true
+    menu.innerHTML = ''
+  }
+  const render = (showAll = false) => {
+    const query = showAll ? '' : input.value.trim().toLowerCase()
+    const matches = state.assets.filter((asset) => !query || asset.name.toLowerCase().includes(query))
+    if (!matches.length) {
+      close()
+      return
+    }
+    menu.innerHTML = matches
+      .map((asset) => `<button type="button" class="jump-option" title="${esc(asset.name)}" data-jump-pick="${esc(asset.name)}">${esc(asset.name)}</button>`)
+      .join('')
+    menu.hidden = false
+  }
+  const pick = (name) => {
+    input.value = name
+    close()
+    // 选中后把焦点还给输入框，但不要再弹出整份候选列表。
+    picker.suppressed = true
+    input.focus()
+    setTimeout(() => { picker.suppressed = false }, 0)
+  }
+
+  input.addEventListener('focus', () => {
+    if (!picker.suppressed) render(true)
+  })
+  input.addEventListener('input', () => render())
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      close()
+      return
+    }
+    if (event.key === 'ArrowDown' && !menu.hidden) {
+      const first = menu.querySelector('.jump-option')
+      if (first) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+  })
+  input.addEventListener('blur', (event) => {
+    if (!menu.contains(event.relatedTarget)) close()
+  })
+  menu.addEventListener('mousedown', (event) => {
+    if (!event.target.closest('[data-jump-pick]')) return
+    // 保持输入框焦点，避免 blur 先把候选列表关掉；真正的选择在 click 里做。
+    event.preventDefault()
+  })
+  menu.addEventListener('click', (event) => {
+    const option = event.target.closest('[data-jump-pick]')
+    if (option) pick(option.dataset.jumpPick)
+  })
+  menu.addEventListener('keydown', (event) => {
+    const option = event.target.closest('[data-jump-pick]')
+    if (!option) return
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      input.focus()
+      close()
+    } else if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      ;(option.nextElementSibling || option).focus()
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      ;(option.previousElementSibling || option).focus()
+    }
+  })
+  menu.addEventListener('focusout', (event) => {
+    if (!input.contains(event.relatedTarget) && !menu.contains(event.relatedTarget)) close()
+  })
+  picker.render = render
+  picker.close = close
+  return picker
 }
 
 function renderCredentialOptions() {
   const select = $('#asset-credential')
   if (!select) return
+  const signature = state.credentials.map((credential) => `${credential.id}:${credential.name}:${credential.type}`).join('|')
+  // 后台轮询每 1.2 秒刷新一次；列表没变就不要重建，否则会关掉正在展开的下拉。
+  if (select.dataset.signature === signature) return
   const current = select.value
   select.innerHTML = `<option value="">不使用凭证</option>${state.credentials
     .map((credential) => `<option value="${esc(credential.id)}">${esc(credential.name)}（${credential.type === 'key' ? '私钥' : '密码'}）</option>`)
     .join('')}`
+  select.dataset.signature = signature
   select.value = state.credentials.some((item) => item.id === current) ? current : ''
-  renderJumpOptions()
 }
 
 function renderCredentials() {
@@ -1667,7 +1892,6 @@ function renderCredentials() {
 }
 
 function renderAssets() {
-  renderJumpOptions()
   const panel = $('#known-hosts-panel')
   if (panel) panel.hidden = !isAdmin()
   const readPaths = $('#asset-read-paths')
@@ -1990,16 +2214,23 @@ async function loadSkillOptions() {
   select.value = current
 }
 
-async function refresh() {
-  if (state.inflight) return
+async function refresh(options = {}) {
+  const force = Boolean(options.force)
+  // 批量操作和切页的刷新不能被正在跑的轮询直接丢掉：等它结束再拉一次，页面不会停在旧数据上。
+  if (state.inflight) {
+    if (!force) return
+    while (state.inflight) await state.inflightPromise
+  }
   // 总览聚合查询比单页重，轮询降到约 4 秒一次；进入页面和手工操作仍会立即刷新。
-  if (state.view === 'overview' && Date.now() - state.overviewAt < 4000) return
+  if (!force && state.view === 'overview' && Date.now() - state.overviewAt < 4000) return
   // 初始密码未修改时后端只放行 me/改密/登出，页面停在安全设置，不再轮询其它接口。
   if (state.authMethod && state.me?.mustChangePassword) {
     render()
     return
   }
   state.inflight = true
+  let finish
+  state.inflightPromise = new Promise((resolve) => { finish = resolve })
   if (state.view === 'overview') state.overviewAt = Date.now()
   try {
     const pending = await api('GET', '/api/approvals?status=pending&limit=1')
@@ -2062,7 +2293,9 @@ async function refresh() {
       state.docs = (await api('GET', '/api/knowledge/docs')).docs
     }
     if (ASSET_VIEWS.includes(state.view)) {
-      state.assets = (await api('GET', '/api/assets')).assets
+      const result = await api('GET', '/api/assets')
+      state.assets = result.assets
+      state.probes = result.probes || {}
       try {
         state.credentials = (await api('GET', '/api/credentials')).credentials
       } catch (error) {
@@ -2130,6 +2363,7 @@ async function refresh() {
     }
   } finally {
     state.inflight = false
+    finish()
   }
 }
 
@@ -2175,6 +2409,11 @@ function switchView(view) {
   const previous = state.view
   state.view = view
   if (previous !== view) clearTransientFeedback()
+  // 离开资产列表就清掉勾选和页码，别让下次进来还挂着上一轮的「已选 N 个」和旧勾选。
+  if (previous === 'asset-list' && view !== 'asset-list') {
+    state.assetSelected.clear()
+    state.assetPage = 1
+  }
   if (view === 'overview') state.overviewAt = 0
   const crumb = $('#crumb-page')
   if (crumb) crumb.textContent = VIEW_LABELS[view] || view
@@ -2192,7 +2431,7 @@ function switchView(view) {
   document.querySelectorAll('[data-view]').forEach((button) => button.classList.toggle('active', button.dataset.view === view))
   if (view === 'security') void loadSecurityEvents()
   syncViewHash(view)
-  return refresh()
+  return refresh({ force: true })
 }
 
 /** 保持地址栏和当前视图一致，方便分享/刷新；用 replaceState 避免污染历史记录。 */
@@ -2688,9 +2927,19 @@ $('#asset-form').addEventListener('submit', async (event) => {
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean)
+  const name = String(data.get('name') || '').trim()
+  const jumpAsset = String(data.get('sshJumpAsset') || '').trim()
+  if (jumpAsset && !state.assets.some((asset) => asset.name === jumpAsset)) {
+    showError(`跳板机资产 ${jumpAsset} 不存在，请从候选中选择`)
+    return
+  }
+  if (jumpAsset && jumpAsset === name) {
+    showError('跳板机不能是资产自己')
+    return
+  }
   try {
     await api('POST', '/api/assets', {
-      name: String(data.get('name') || '').trim(),
+      name,
       host: String(data.get('host') || '').trim(),
       ip: String(data.get('ip') || '').trim(),
       env: String(data.get('env') || '').trim(),
@@ -2711,6 +2960,9 @@ $('#asset-form').addEventListener('submit', async (event) => {
     showError(error.message)
   }
 })
+
+setupAssetJumpPicker('#asset-jump', '#asset-jump-menu')
+setupAssetJumpPicker('#asset-bulk-jump', '#asset-bulk-jump-menu')
 
 $('#asset-reset').addEventListener('click', () => {
   clearForm($('#asset-form'))
@@ -2763,6 +3015,196 @@ function assetNotice(message, tone = '') {
   node.textContent = message || ''
   node.className = `notice${tone ? ` ${tone}` : ''}`
   if (message && tone) node.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' })
+}
+
+function setAssetBusy(busy) {
+  state.assetBulkBusy = busy
+  renderAssetBulk()
+  renderAssetTable()
+}
+
+function chunkList(list, size) {
+  const chunks = []
+  for (let index = 0; index < list.length; index += size) chunks.push(list.slice(index, index + size))
+  return chunks
+}
+
+/** 批量 SSH 测试 / 主机密钥校验：服务端每批并发 4，客户端按 20 个一批推进并报告进度。 */
+async function runAssetBatchChecks(action, names) {
+  const kind = action === 'ssh-test' ? '测试连接' : '校验主机密钥'
+  if (action === 'ssh-test' && !window.confirm(`对选中的 ${names.length} 个资产逐个建立完整 SSH 连接（认证 + 跳板机 + 主机密钥），可能耗时较长，继续？`)) return
+  showError('')
+  setAssetBusy(true)
+  const failures = []
+  // 探测成功但还没有指纹的资产：管理员确认后可以批量信任（只补空白，绝不覆盖已有指纹）。
+  const trustable = []
+  let done = 0
+  let ok = 0
+  let mismatch = 0
+  let untrusted = 0
+  try {
+    for (const part of chunkList(names, 20)) {
+      assetNotice(`正在${kind}：已完成 ${done}/${names.length}…`, 'progress')
+      const response = await api('POST', `/api/assets/batch/${action}`, { names: part })
+      for (const item of response.results || []) {
+        if (!item.ok) {
+          failures.push(`${item.name}（${item.error}）`)
+          continue
+        }
+        ok += 1
+        if (action === 'host-key') {
+          const info = item.result || {}
+          if (info.trusted) continue
+          if (info.expected) mismatch += 1
+          else {
+            untrusted += 1
+            if (info.fingerprint) trustable.push(item.name)
+          }
+        }
+      }
+      done += part.length
+    }
+    const head = action === 'ssh-test'
+      ? `测试连接完成：成功 ${ok}，失败 ${failures.length}`
+      : `主机密钥校验完成：一致 ${ok - mismatch - untrusted}，不一致 ${mismatch}，未信任 ${untrusted}，失败 ${failures.length}`
+    const detail = failures.length ? `。失败：${failures.slice(0, 3).join('；')}${failures.length > 3 ? ` 等 ${failures.length} 个` : ''}` : '。'
+    assetNotice(`${head}${detail}`, failures.length || mismatch ? 'warn' : 'ok')
+    if (action === 'host-key' && trustable.length) {
+      if (!isAdmin()) {
+        assetNotice(`${head}${detail}未信任的指纹需要管理员确认后才会生效。`, 'warn')
+      } else if (window.confirm(`有 ${trustable.length} 个资产尚未信任主机密钥，例如 ${trustable.slice(0, 5).join('、')}${trustable.length > 5 ? ` 等 ${trustable.length} 个` : ''}。\n\n信任它们当前探测到的指纹？只补没有指纹的资产；不一致的指纹不会批量处理，仍需逐台确认。`)) {
+        let trustedCount = 0
+        let settledTrust = 0
+        const failedTrust = []
+        try {
+          for (const part of chunkList(trustable, 20)) {
+            assetNotice(`正在信任主机密钥（服务端重新探测指纹）：已完成 ${settledTrust}/${trustable.length}…`, 'progress')
+            const result = await api('POST', '/api/assets/batch/host-key/trust', { names: part })
+            settledTrust += part.length
+            for (const name of result.trusted || []) {
+              trustedCount += 1
+              state.assetSelected.delete(name)
+            }
+            for (const item of result.skipped || []) failedTrust.push(`${item.name}（${item.error}）`)
+            for (const item of result.failed || []) failedTrust.push(`${item.name}（${item.error}）`)
+          }
+        } catch (error) {
+          failedTrust.push(`批量信任失败（${error.message}）`)
+        }
+        const failText = failedTrust.length
+          ? `，失败 ${failedTrust.length}：${failedTrust.slice(0, 3).join('；')}${failedTrust.length > 3 ? ` 等 ${failedTrust.length} 个` : ''}`
+          : ''
+        const probeHint = trustedCount ? '。状态列会在下一轮 SSH 连接测试后更新' : ''
+        assetNotice(`已信任 ${trustedCount} 个主机密钥${failText}${probeHint}。`, failedTrust.length ? 'warn' : 'ok')
+        await refresh({ force: true })
+      }
+    }
+  } catch (error) {
+    assetNotice(`${kind}失败：${error.message}`, 'error')
+  } finally {
+    setAssetBusy(false)
+  }
+}
+
+async function runAssetBulk(action) {
+  if (state.assetBulkBusy) return
+  const names = [...state.assetSelected]
+  if (!names.length) return
+  if (action === 'ssh-test' || action === 'host-key') {
+    await runAssetBatchChecks(action, names)
+    return
+  }
+  if (action === 'credential') {
+    const select = $('#asset-bulk-credential')
+    const chosen = select?.value || ''
+    if (!chosen) {
+      assetNotice('先选择一个凭证，或选「清除凭证引用」。', 'warn')
+      return
+    }
+    const label = chosen === '__clear__'
+      ? '不使用凭证'
+      : (state.credentials.find((item) => item.id === chosen)?.name || chosen)
+    if (!window.confirm(`把选中的 ${names.length} 个资产的凭证改为「${label}」？这会覆盖原有凭证引用${chosen === '__clear__' ? '' : '，并清除资产上的内联密码/私钥'}。`)) return
+    showError('')
+    assetNotice(`正在为 ${names.length} 个资产设置凭证…`, 'progress')
+    setAssetBusy(true)
+    try {
+      const result = await api('POST', '/api/assets/batch/credential', {
+        names,
+        credentialId: chosen === '__clear__' ? '' : chosen,
+      })
+      const failed = result.failed || []
+      const detail = failed.length
+        ? `，失败 ${failed.length}：${failed.slice(0, 3).map((item) => `${item.name}（${item.error}）`).join('；')}`
+        : ''
+      assetNotice(`凭证已更新 ${result.updated.length} 个资产${detail}。`, failed.length ? 'warn' : 'ok')
+      // 成功的取消勾选，失败的留着方便重试；全部成功时批量工具条自动收起。
+      for (const asset of result.updated || []) state.assetSelected.delete(asset.name)
+      await refresh({ force: true })
+    } catch (error) {
+      assetNotice(`设置凭证失败：${error.message}`, 'error')
+    } finally {
+      setAssetBusy(false)
+    }
+    return
+  }
+  if (action === 'jump' || action === 'jump-clear') {
+    const clearing = action === 'jump-clear'
+    const jump = clearing ? '' : ($('#asset-bulk-jump')?.value || '').trim()
+    if (!clearing && !jump) {
+      assetNotice('先输入跳板机资产名，或从候选列表里选一个。', 'warn')
+      return
+    }
+    if (!clearing && !state.assets.some((asset) => asset.name === jump)) {
+      assetNotice(`跳板机资产不存在：${jump}`, 'warn')
+      return
+    }
+    const label = clearing ? '不使用跳板机' : jump
+    if (!window.confirm(`把选中的 ${names.length} 个资产的跳板机设为「${label}」？成环或引用自己的资产会单独失败。`)) return
+    showError('')
+    assetNotice(`正在为 ${names.length} 个资产设置跳板机…`, 'progress')
+    setAssetBusy(true)
+    try {
+      const result = await api('POST', '/api/assets/batch/jump', { names, jumpAsset: jump })
+      const failed = result.failed || []
+      const detail = failed.length
+        ? `，失败 ${failed.length}：${failed.slice(0, 3).map((item) => `${item.name}（${item.error}）`).join('；')}`
+        : ''
+      const hint = result.updated.length
+        ? '。跳板机只改 SSH 连接路径，主机密钥仍需逐台校验后资产才会参与连接测试'
+        : ''
+      assetNotice(`跳板机已更新 ${result.updated.length} 个资产${detail}${hint}。`, failed.length ? 'warn' : 'ok')
+      const input = $('#asset-bulk-jump')
+      if (input && !clearing) input.value = ''
+      // 成功的取消勾选，失败的留着方便重试；全部成功时批量工具条自动收起。
+      for (const asset of result.updated || []) state.assetSelected.delete(asset.name)
+      await refresh({ force: true })
+    } catch (error) {
+      assetNotice(`设置跳板机失败：${error.message}`, 'error')
+    } finally {
+      setAssetBusy(false)
+    }
+    return
+  }
+  if (action === 'delete') {
+    if (!window.confirm(`删除选中的 ${names.length} 个资产？正被其他资产用作跳板机的会删除失败。`)) return
+    showError('')
+    setAssetBusy(true)
+    try {
+      const result = await api('POST', '/api/assets/batch/delete', { names })
+      for (const name of result.deleted || []) state.assetSelected.delete(name)
+      const failed = result.failed || []
+      const detail = failed.length
+        ? `，失败 ${failed.length}：${failed.slice(0, 3).map((item) => `${item.name}（${item.error}）`).join('；')}`
+        : ''
+      assetNotice(`已删除 ${result.deleted.length} 个资产${detail}。`, failed.length ? 'warn' : 'ok')
+      await refresh()
+    } catch (error) {
+      assetNotice(`批量删除失败：${error.message}`, 'error')
+    } finally {
+      setAssetBusy(false)
+    }
+  }
 }
 
 async function onAssetAction(event) {
@@ -2837,6 +3279,153 @@ async function onAssetAction(event) {
 
 $('#asset-list').addEventListener('click', onAssetAction)
 $('#asset-table').addEventListener('click', onAssetAction)
+
+$('#asset-search').addEventListener('input', (event) => {
+  state.assetQuery = event.target.value
+  state.assetPage = 1
+  renderAssetTable()
+})
+
+$('#asset-page-size').addEventListener('change', (event) => {
+  state.assetPageSize = Number(event.target.value) || 20
+  state.assetPage = 1
+  renderAssetTable()
+})
+
+$('#asset-pager').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-asset-page]')
+  if (!button || button.disabled) return
+  state.assetPage = Number(button.dataset.assetPage) || 1
+  renderAssetTable()
+})
+
+$('#asset-select-all').addEventListener('change', (event) => {
+  const checked = Boolean(event.target.checked)
+  for (const asset of currentAssetPage()) {
+    if (checked) state.assetSelected.add(asset.name)
+    else state.assetSelected.delete(asset.name)
+  }
+  renderAssetTable()
+})
+
+$('#asset-table').addEventListener('change', (event) => {
+  const box = event.target.closest('[data-select-asset]')
+  if (!box) return
+  if (box.checked) state.assetSelected.add(box.dataset.selectAsset)
+  else state.assetSelected.delete(box.dataset.selectAsset)
+  renderAssetTable()
+})
+
+$('#asset-bulk').addEventListener('click', (event) => {
+  const action = event.target.closest('[data-bulk-action]')
+  if (action) {
+    void runAssetBulk(action.dataset.bulkAction)
+    return
+  }
+  if (event.target.closest('#asset-selection-clear')) {
+    state.assetSelected.clear()
+    renderAssetTable()
+  }
+})
+
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const data = String(reader.result || '')
+      const comma = data.indexOf(',')
+      resolve(comma >= 0 ? data.slice(comma + 1) : data)
+    }
+    reader.onerror = () => reject(new Error('读取文件失败'))
+    reader.readAsDataURL(file)
+  })
+}
+
+function renderAssetImportResult(result) {
+  const node = $('#asset-import-result')
+  if (!node) return
+  const mode = result.mode === 'overwrite' ? '覆盖同名' : '跳过同名'
+  const lines = result.entries.map((entry) => {
+    const name = entry.name || '（无名称）'
+    return entry.status === 'imported'
+      ? `<li class="imported">第 ${entry.row} 行 ${esc(name)} · 导入成功</li>`
+      : `<li class="failed">第 ${entry.row} 行 ${esc(name)} · ${esc(entry.error || '导入失败')}</li>`
+  }).join('')
+  node.hidden = false
+  node.className = `asset-import-result${result.failed ? ' warn' : ''}`
+  node.innerHTML = `
+    <div class="import-head">
+      <strong>导入完成（${mode}）：成功 ${result.imported}，失败 ${result.failed}，共 ${result.total} 行</strong>
+      <button type="button" class="link" data-import-close>收起</button>
+    </div>
+    <ul>${lines}</ul>
+  `
+  node.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' })
+}
+
+async function importAssetsFile(file) {
+  if (!file) return
+  const overwrite = Boolean($('#asset-import-overwrite')?.checked)
+  const pick = $('#asset-import-pick')
+  if (pick) pick.disabled = true
+  showError('')
+  assetNotice(`正在导入 ${file.name}（${overwrite ? '覆盖同名' : '跳过同名'}）…`, 'progress')
+  try {
+    const fileData = await readFileAsBase64(file)
+    const response = await api('POST', '/api/assets/import', {
+      file: fileData,
+      mode: overwrite ? 'overwrite' : 'skip',
+    })
+    const result = response.result
+    renderAssetImportResult(result)
+    assetNotice(`导入完成：成功 ${result.imported}，失败 ${result.failed}。逐行日志见下方。`, result.failed ? 'warn' : 'ok')
+    await refresh()
+  } catch (error) {
+    assetNotice(`导入失败：${error.message}`, 'error')
+  } finally {
+    if (pick) pick.disabled = false
+    const input = $('#asset-import-file')
+    if (input) input.value = ''
+  }
+}
+
+async function exportAssetsFile() {
+  const button = $('#asset-export')
+  if (button) button.disabled = true
+  showError('')
+  assetNotice('正在生成资产表格…', 'progress')
+  try {
+    const response = await fetch('/api/assets/export', { credentials: 'same-origin' })
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}))
+      throw new Error(data.error?.message || `导出失败（HTTP ${response.status}）`)
+    }
+    const blob = await response.blob()
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `assets-${new Date().toISOString().slice(0, 10)}.xlsx`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+    assetNotice('已导出资产表；没有资产时就是可直接填写的模板。', 'ok')
+  } catch (error) {
+    assetNotice(`导出失败：${error.message}`, 'error')
+  } finally {
+    if (button) button.disabled = false
+  }
+}
+
+$('#asset-export').addEventListener('click', () => { void exportAssetsFile() })
+$('#asset-import-pick').addEventListener('click', () => $('#asset-import-file').click())
+$('#asset-import-file').addEventListener('change', (event) => {
+  const file = event.target.files && event.target.files[0]
+  void importAssetsFile(file)
+})
+$('#asset-import-result').addEventListener('click', (event) => {
+  if (event.target.closest('[data-import-close]')) $('#asset-import-result').hidden = true
+})
 
 $('#credential-type').addEventListener('change', setCredentialType)
 

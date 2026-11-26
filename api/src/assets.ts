@@ -83,6 +83,11 @@ const NAME = /^[a-z0-9][a-z0-9._-]*$/
  */
 export class AssetStore {
   private records: AssetRecord[] | undefined
+  /** 写盘串行队列：批量操作会并发 upsert，不能共用一个临时文件互相覆盖。 */
+  private writeChain: Promise<void> = Promise.resolve()
+  private tempSeq = 0
+  /** 首次加载只跑一次，并发调用共用同一个 Promise，避免后完成的加载覆盖已有修改。 */
+  private loadPromise: Promise<void> | undefined
 
   constructor(
     private readonly file: string | null,
@@ -181,7 +186,12 @@ export class AssetStore {
     }
   }
 
-  private async load(): Promise<void> {
+  private load(): Promise<void> {
+    this.loadPromise ??= this.loadRecords()
+    return this.loadPromise
+  }
+
+  private async loadRecords(): Promise<void> {
     if (this.records) return
     if (!this.file) {
       this.records = this.seed.map((item) => ({ ...item }))
@@ -206,16 +216,25 @@ export class AssetStore {
     }
   }
 
-  private async persist(): Promise<void> {
-    if (!this.file) return
-    await mkdir(path.dirname(this.file), { recursive: true })
-    const records = (this.records ?? []).map((item) =>
-      encryptFields(this.codec, item as unknown as Record<string, unknown>, SECRETS),
-    )
-    const temp = `${this.file}.${process.pid}.tmp`
-    await writeFile(temp, JSON.stringify({ assets: records }, null, 2), { mode: 0o600 })
-    await rename(temp, this.file)
-    await chmod(this.file, 0o600)
+  private persist(): Promise<void> {
+    if (!this.file) return Promise.resolve()
+    const file = this.file
+    const run = async (): Promise<void> => {
+      await mkdir(path.dirname(file), { recursive: true })
+      // 串行执行时再取快照，保证最后落盘的一定是包含全部已完成修改的版本。
+      const records = (this.records ?? []).map((item) =>
+        encryptFields(this.codec, item as unknown as Record<string, unknown>, SECRETS),
+      )
+      this.tempSeq += 1
+      const temp = `${file}.${process.pid}.${this.tempSeq}.tmp`
+      await writeFile(temp, JSON.stringify({ assets: records }, null, 2), { mode: 0o600 })
+      await rename(temp, file)
+      await chmod(file, 0o600)
+    }
+    // 一次写入失败不能卡死后续写入：队列继续推进，错误仍然抛给当前调用方。
+    const next = this.writeChain.then(run, run)
+    this.writeChain = next.catch(() => undefined)
+    return next
   }
 }
 

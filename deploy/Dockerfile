@@ -1,7 +1,10 @@
 # syntax=docker/dockerfile:1
 
+# 基础镜像默认官方 node；国内网络可在 docker-compose.override.yml 用 build.args 换镜像源。
+ARG NODE_IMAGE=node:22-bookworm-slim
+
 # 构建阶段：把 TypeScript 编译成 JS，运行镜像不带 tsx 和源码工具链。
-FROM node:22-bookworm-slim AS build
+FROM ${NODE_IMAGE} AS build
 ARG NPM_REGISTRY=https://registry.npmmirror.com
 WORKDIR /app
 COPY package.json package-lock.json ./
@@ -12,7 +15,7 @@ COPY extensions ./extensions
 RUN npm run build
 
 # 运行阶段：只保留生产依赖，非 root，根文件系统可只读挂载。
-FROM node:22-bookworm-slim AS runtime
+FROM ${NODE_IMAGE} AS runtime
 ARG NPM_REGISTRY=https://registry.npmmirror.com
 WORKDIR /app
 ENV NODE_ENV=production \

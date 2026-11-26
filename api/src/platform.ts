@@ -14,6 +14,8 @@ import {
   type AlertSourceView,
   type NormalizedAlert,
 } from './alert-sources.ts'
+import { buildAssetWorkbook, type AssetImportResult, type AssetImportRow } from './asset-io.ts'
+import { assetSshBlockedReason, type AssetProbeResult } from './asset-probe.ts'
 import { normalizeFingerprint, toAssetView, type AssetRecord, type AssetStore, type AssetView } from './assets.ts'
 import {
   toCredentialView,
@@ -46,6 +48,46 @@ import {
 import type { Actor, Approval, AuditRecord, Task, TaskEvent, TaskStatus, TaskUsage, Tool, ToolOutcome } from './types.ts'
 
 const TERMINAL = new Set<TaskStatus>(['succeeded', 'failed', 'cancelled'])
+
+export interface AssetBatchFailure {
+  name: string
+  error: string
+}
+
+export interface AssetBatchResult<T> {
+  name: string
+  ok: boolean
+  result?: T
+  error?: string
+}
+
+/** 批量资产操作的入参：去重、去空、限制数量，避免一次请求打满。 */
+function normalizeAssetNames(value: unknown, limit = 200): string[] {
+  if (!Array.isArray(value)) throw new PlatformError('names 必须是资产名数组', 400, 'bad_request')
+  const names: string[] = []
+  for (const item of value) {
+    const name = typeof item === 'string' ? item.trim() : ''
+    if (name && !names.includes(name)) names.push(name)
+  }
+  if (!names.length) throw new PlatformError('names 不能为空', 400, 'bad_request')
+  if (names.length > limit) throw new PlatformError(`单次最多处理 ${limit} 个资产`, 400, 'bad_request')
+  return names
+}
+
+/** 有限并发地跑一批异步任务，顺序与输入一致。 */
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let cursor = 0
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor
+      cursor += 1
+      results[index] = await fn(items[index]!)
+    }
+  })
+  await Promise.all(workers)
+  return results
+}
 
 /** admin 在权限判断上等价于 operator + approver；自批红线仍然单独校验。 */
 function isOperator(actor: Actor): boolean {
@@ -153,6 +195,17 @@ function parseToolArgs(raw: string): Record<string, unknown> {
   return parsed as Record<string, unknown>
 }
 
+const METRICS_QL_ESCAPE_HINT =
+  'MetricsQL 语法提示：双引号字符串按 Go 转义解析，正则里的点号要写成 \\\\.（例如 instance=~".*17\\\\.(10|11|12)"），或者改用字符类 [.]、反引号原始字符串；不要写成 \\.。修正查询后重新调用同一工具。'
+
+/** VictoriaMetrics 报字符串字面量非法时，把正确的正则转义写法带回给模型，避免反复试探。 */
+function metricsQlEscapeHint(outcome: ToolOutcome): string {
+  let message = ''
+  if (outcome.status === 'error') message = outcome.error
+  else if (outcome.status === 'denied') message = outcome.reason
+  return /cannot parse string literal/i.test(message) ? METRICS_QL_ESCAPE_HINT : ''
+}
+
 function formatOutcomeForModel(outcome: ToolOutcome, limit: number): string {
   let payload: Record<string, unknown>
   if (outcome.status === 'ok') {
@@ -174,9 +227,11 @@ function formatOutcomeForModel(outcome: ToolOutcome, limit: number): string {
   } catch {
     text = JSON.stringify({ status: outcome.status })
   }
-  return text.length <= limit
+  const formatted = text.length <= limit
     ? text
     : `${text.slice(0, limit)}…[结果已截断] 只基于已返回内容作答；需要更多数据时缩小查询范围（namespace/name/label selector），不要改用 kubectl、helm 等变更工具。`
+  const hint = metricsQlEscapeHint(outcome)
+  return hint ? `${formatted} ${hint}` : formatted
 }
 
 function agentSystemPrompt(skill: Skill): string {
@@ -373,7 +428,7 @@ export interface PlatformOptions {
   model?: ChatModel
   /** 多 provider 解析器；优先于 model。没有可用 provider 时返回 undefined，退回 playbook。 */
   modelResolver?: ModelResolver
-  /** 模型循环最多调用几轮，默认 8，范围 1-30。 */
+  /** 模型循环最多调用几轮，默认 8，范围 1-50。 */
   agentMaxSteps?: number
   /** 回填给模型的单个工具结果上限，避免上下文爆炸；默认 12000 字符。 */
   agentToolOutputChars?: number
@@ -389,6 +444,11 @@ export interface PlatformOptions {
   alertSources?: AlertSourceStore
   /** 定向通知：告警结果只推给接入源勾选的渠道，不走全局事件订阅。 */
   notifyTargets?: (webhookIds: string[], event: NotificationEvent) => void | Promise<DeliveredNotification[]>
+  /**
+   * SSH 连接测试缓存。与 `createAssetTools` 共用同一个 Map，
+   * 模型读 asset.list 时能看到后台最近一次的连接结果。
+   */
+  assetProbes?: Map<string, AssetProbeResult>
   /** 平台对外地址，用于告警任务深链；默认不带链接。 */
   publicUrl?: string
   /** 同时运行的告警任务上限，默认 3；超出直接忽略并计数，避免告警风暴。 */
@@ -497,10 +557,15 @@ export class Platform {
   private readonly alertRate = new Map<string, { count: number; resetAt: number }>()
   /** 当前运行中的告警任务数，配合 alertMaxConcurrency 限流。 */
   private alertActive = 0
+  /** SSH 连接测试缓存，按资产名索引；仅进程内，不落盘、不写审计参数里的主机明细。 */
+  private readonly assetProbes: Map<string, AssetProbeResult>
+  /** 一轮探测没跑完时不再叠加，避免 SSH 会话越堆越多。 */
+  private assetProbeRunning = false
 
   constructor(private readonly options: PlatformOptions) {
     this.actors = new Map(options.actors.map((actor) => [actor.id, actor]))
     this.store = options.store ?? new MemoryStore()
+    this.assetProbes = options.assetProbes ?? new Map()
     this.gate = new ApprovalGate(options.approvalPollMs)
     for (const tool of options.tools) this.toolBaseRisk.set(tool.name, tool.risk)
     this.broker = new ToolBroker(
@@ -1474,10 +1539,396 @@ export class Platform {
       }
     }
     try {
-      return toAssetView(await this.options.assets.upsert(input))
+      const saved = await this.options.assets.upsert(input)
+      // 主机、凭证或端口可能变了，旧连接状态不再可信。
+      this.dropAssetProbe(saved.name)
+      return toAssetView(saved)
     } catch (error) {
       throw new PlatformError(error instanceof Error ? error.message : '资产保存失败', 400, 'bad_request')
     }
+  }
+
+  /** 最近一次 SSH 连接测试结果，按资产名索引；进程内缓存，重启即清空。 */
+  listAssetProbes(actorId: string): Record<string, AssetProbeResult> {
+    this.requireActor(actorId)
+    return Object.fromEntries(this.assetProbes)
+  }
+
+  /** 资产或凭证变化后清掉对应缓存，避免页面和模型拿旧的「可连接」状态。 */
+  private dropAssetProbe(name: string): void {
+    this.assetProbes.delete(name)
+  }
+
+  /**
+   * 后台连接测试：对配置齐全的资产（有主机、SSH 用户、凭证和已信任主机密钥）
+   * 真实建立一次 SSH 连接（含认证、跳板机和主机密钥校验），不执行命令。
+   * 缺配置的资产不发起连接，只记 blockedReason；没有手动入口，由 compose 定时调用。
+   */
+  async probeAssets(timeoutMs = 15_000): Promise<{
+    checkedAt: string
+    results: AssetProbeResult[]
+    skipped?: boolean
+  }> {
+    const checkedAt = new Date().toISOString()
+    if (this.assetProbeRunning) {
+      // 上一轮还没跑完（资产多、超时长），直接复用当前缓存，不再叠加登录。
+      return { checkedAt, results: [...this.assetProbes.values()].map((item) => ({ ...item })), skipped: true }
+    }
+    this.assetProbeRunning = true
+    try {
+      const timeout = clampInteger(timeoutMs, 1_000, 30_000)
+      const all = await this.options.assets.list()
+      const keep = new Set(all.map((asset) => asset.name))
+      for (const name of [...this.assetProbes.keys()]) {
+        if (!keep.has(name)) this.assetProbes.delete(name)
+      }
+      const results = await mapLimit(all, 4, async (asset): Promise<AssetProbeResult> => {
+        const host = asset.ip || asset.host
+        const target = host ? `${host}:${asset.sshPort ?? 22}` : undefined
+        const blocked = await assetSshBlockedReason(asset, this.options.credentials)
+        if (blocked) {
+          const result: AssetProbeResult = {
+            name: asset.name,
+            status: 'unknown',
+            checkedAt,
+            ...(target ? { target } : {}),
+            error: blocked,
+            blockedReason: blocked,
+          }
+          this.assetProbes.set(asset.name, result)
+          return result
+        }
+        const startedAt = Date.now()
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), timeout)
+        timer.unref?.()
+        try {
+          await testAssetConnection(
+            this.options.assets,
+            this.options.credentials,
+            asset.name,
+            controller.signal,
+          )
+          const result: AssetProbeResult = {
+            name: asset.name,
+            status: 'up',
+            checkedAt,
+            ...(target ? { target } : {}),
+            latencyMs: Date.now() - startedAt,
+          }
+          this.assetProbes.set(asset.name, result)
+          return result
+        } catch (error) {
+          const message = controller.signal.aborted
+            ? 'SSH 连接超时：检查 IP、端口、网络和防火墙'
+            : describeSshConnectError(error)
+          const result: AssetProbeResult = {
+            name: asset.name,
+            status: 'down',
+            checkedAt,
+            ...(target ? { target } : {}),
+            error: message,
+          }
+          this.assetProbes.set(asset.name, result)
+          return result
+        } finally {
+          clearTimeout(timer)
+        }
+      })
+      return { checkedAt, results }
+    } finally {
+      this.assetProbeRunning = false
+    }
+  }
+
+  async deleteAssets(actorId: string, input: unknown): Promise<{ deleted: string[]; failed: AssetBatchFailure[] }> {
+    const actor = this.requireActor(actorId)
+    if (!isOperator(actor)) throw new PlatformError('当前身份不能修改资产', 403, 'forbidden')
+    const names = normalizeAssetNames(input)
+    const deleted: string[] = []
+    const failed: AssetBatchFailure[] = []
+    for (const name of names) {
+      try {
+        if (await this.options.assets.remove(name)) {
+          deleted.push(name)
+          this.assetProbes.delete(name)
+        } else {
+          failed.push({ name, error: '资产不存在' })
+        }
+      } catch (error) {
+        failed.push({ name, error: error instanceof Error ? error.message : '删除失败' })
+      }
+    }
+    return { deleted, failed }
+  }
+
+  /**
+   * 批量设置凭证：只改引用，不动主机和其他字段；写凭证会清掉资产上的内联密码/私钥。
+   * credentialId 为空表示解除引用，已有内联密钥不会被删除。
+   */
+  async assignAssetCredential(
+    actorId: string,
+    input: unknown,
+    credentialId: string,
+  ): Promise<{ updated: AssetView[]; failed: AssetBatchFailure[] }> {
+    const actor = this.requireActor(actorId)
+    if (!isOperator(actor)) throw new PlatformError('当前身份不能修改资产', 403, 'forbidden')
+    const names = normalizeAssetNames(input)
+    const id = credentialId.trim()
+    if (id) {
+      const credential = await this.options.credentials.get(id)
+      if (!credential) throw new PlatformError('SSH 凭证不存在', 400, 'bad_request')
+    }
+    const updated: AssetView[] = []
+    const failed: AssetBatchFailure[] = []
+    for (const name of names) {
+      const asset = await this.options.assets.get(name)
+      if (!asset) {
+        failed.push({ name, error: '资产不存在' })
+        continue
+      }
+      try {
+        const record: AssetRecord = { ...asset, sshCredentialId: id || undefined }
+        if (id) {
+          record.sshPassword = undefined
+          record.sshKey = undefined
+          record.sshPassphrase = undefined
+        }
+        updated.push(toAssetView(await this.options.assets.upsert(record)))
+        this.dropAssetProbe(name)
+      } catch (error) {
+        failed.push({ name, error: error instanceof Error ? error.message : '设置凭证失败' })
+      }
+    }
+    return { updated, failed }
+  }
+
+  /**
+   * 批量设置跳板机：只改 sshJumpAsset 引用，逐条校验存在性、自引用和环路。
+   * jumpAsset 为空表示解除跳板机。
+   */
+  async assignAssetJump(
+    actorId: string,
+    input: unknown,
+    jumpAsset: string,
+  ): Promise<{ updated: AssetView[]; failed: AssetBatchFailure[] }> {
+    const actor = this.requireActor(actorId)
+    if (!isOperator(actor)) throw new PlatformError('当前身份不能修改资产', 403, 'forbidden')
+    const names = normalizeAssetNames(input)
+    const jump = jumpAsset.trim()
+    if (jump && !(await this.options.assets.get(jump))) {
+      throw new PlatformError(`跳板机资产不存在：${jump}`, 400, 'bad_request')
+    }
+    const updated: AssetView[] = []
+    const failed: AssetBatchFailure[] = []
+    for (const name of names) {
+      const asset = await this.options.assets.get(name)
+      if (!asset) {
+        failed.push({ name, error: '资产不存在' })
+        continue
+      }
+      try {
+        const record: AssetRecord = { ...asset, sshJumpAsset: jump || undefined }
+        updated.push(toAssetView(await this.options.assets.upsert(record)))
+        this.dropAssetProbe(name)
+      } catch (error) {
+        failed.push({ name, error: error instanceof Error ? error.message : '设置跳板机失败' })
+      }
+    }
+    return { updated, failed }
+  }
+
+  /** 导出资产表；没有资产时导出的就是可直接填写的模板（xlsx Buffer）。 */
+  async exportAssetsWorkbook(actorId: string): Promise<Buffer> {
+    const actor = this.requireActor(actorId)
+    if (!isOperator(actor)) throw new PlatformError('当前身份不能导出资产', 403, 'forbidden')
+    const assets = await this.options.assets.list()
+    const credentials = await this.options.credentials.list()
+    const names = new Map(credentials.map((credential) => [credential.id, credential.name]))
+    return buildAssetWorkbook(assets.map(toAssetView), names)
+  }
+
+  /**
+   * 逐行导入资产：失败行记录原因后继续，绝不中断整批。
+   * skip 跳过同名；overwrite 按行更新（保留主机密钥指纹和 SSH 只读路径）。
+   */
+  async importAssets(
+    actorId: string,
+    rows: AssetImportRow[],
+    mode: 'skip' | 'overwrite',
+  ): Promise<AssetImportResult> {
+    const actor = this.requireActor(actorId)
+    if (!isOperator(actor)) throw new PlatformError('当前身份不能导入资产', 403, 'forbidden')
+    if (!Array.isArray(rows) || rows.length === 0) {
+      throw new PlatformError('表格里没有可导入的资产行', 400, 'bad_request')
+    }
+    if (rows.length > 2000) throw new PlatformError('单次最多导入 2000 行资产', 413, 'too_large')
+    const overwrite = mode === 'overwrite'
+    const credentials = await this.options.credentials.list()
+    const credentialIdByName = new Map<string, string>()
+    for (const credential of credentials) {
+      if (!credentialIdByName.has(credential.name)) credentialIdByName.set(credential.name, credential.id)
+    }
+    const firstRowByName = new Map<string, number>()
+    const entries: AssetImportResult['entries'] = []
+    let imported = 0
+    const fail = (row: AssetImportRow, error: string): void => {
+      entries.push({ row: row.row, name: row.name, status: 'failed', error })
+    }
+
+    for (const row of rows) {
+      const name = typeof row.name === 'string' ? row.name.trim() : ''
+      if (row.error) {
+        fail(row, row.error)
+        continue
+      }
+      if (!name) {
+        fail(row, '名称不能为空')
+        continue
+      }
+      const seen = firstRowByName.get(name)
+      if (seen !== undefined) {
+        fail(row, `名称在文件中重复，第 ${seen} 行已出现`)
+        continue
+      }
+      firstRowByName.set(name, row.row)
+
+      const existing = await this.options.assets.get(name)
+      if (existing && !overwrite) {
+        fail(row, '同名资产已存在（当前为跳过模式，可勾选覆盖同名资产）')
+        continue
+      }
+
+      const credentialName = row.credentialName?.trim() ?? ''
+      let credentialId: string | undefined
+      if (credentialName) {
+        credentialId = credentialIdByName.get(credentialName)
+        if (!credentialId) {
+          fail(row, `凭证不存在：${credentialName}`)
+          continue
+        }
+      }
+
+      const jumpAsset = row.jumpAsset?.trim() ?? ''
+      if (jumpAsset) {
+        if (jumpAsset === name) {
+          fail(row, '资产不能把自己作为跳板机')
+          continue
+        }
+        if (!(await this.options.assets.get(jumpAsset))) {
+          fail(row, `跳板机资产不存在：${jumpAsset}`)
+          continue
+        }
+      }
+
+      const record: AssetRecord = {
+        name,
+        host: row.host?.trim() || undefined,
+        ip: row.ip?.trim() || undefined,
+        env: row.env?.trim() || undefined,
+        owner: row.owner?.trim() || undefined,
+        tier: row.tier?.trim() || undefined,
+        repo: row.repo?.trim() || undefined,
+        note: row.note?.trim() || undefined,
+        sshPort: row.sshPort,
+        sshUser: row.sshUser?.trim() || undefined,
+        sshCredentialId: credentialId,
+        sshJumpAsset: jumpAsset || undefined,
+        ...(existing?.sshHostKeyFingerprint ? { sshHostKeyFingerprint: existing.sshHostKeyFingerprint } : {}),
+        ...(existing?.sshReadPaths?.length ? { sshReadPaths: [...existing.sshReadPaths] } : {}),
+      }
+      try {
+        await this.options.assets.upsert(record)
+        this.dropAssetProbe(name)
+        imported += 1
+        entries.push({ row: row.row, name, status: 'imported' })
+      } catch (error) {
+        fail(row, error instanceof Error ? error.message : '写入失败')
+      }
+    }
+
+    return {
+      total: rows.length,
+      imported,
+      failed: rows.length - imported,
+      mode: overwrite ? 'overwrite' : 'skip',
+      entries,
+    }
+  }
+
+  /** 批量完整 SSH 测试（认证 + 跳板机 + 主机密钥），并发 4，避免一次压满网络。 */
+  async testAssetsSsh(
+    actorId: string,
+    input: unknown,
+  ): Promise<AssetBatchResult<Awaited<ReturnType<Platform['testAssetSsh']>>>[]> {
+    const actor = this.requireActor(actorId)
+    if (!isOperator(actor)) throw new PlatformError('当前身份不能测试资产连接', 403, 'forbidden')
+    const names = normalizeAssetNames(input, 100)
+    return mapLimit(names, 4, async (name) => {
+      try {
+        return { name, ok: true, result: await this.testAssetSsh(actorId, name) }
+      } catch (error) {
+        return { name, ok: false, error: error instanceof Error ? error.message : '连接失败' }
+      }
+    })
+  }
+
+  /** 批量主机密钥探测：只握手，不信任、不写数据。 */
+  async probeAssetsHostKey(
+    actorId: string,
+    input: unknown,
+  ): Promise<AssetBatchResult<Awaited<ReturnType<Platform['probeAssetHostKey']>>>[]> {
+    const actor = this.requireActor(actorId)
+    if (!isOperator(actor)) throw new PlatformError('当前身份不能探测资产', 403, 'forbidden')
+    const names = normalizeAssetNames(input, 100)
+    return mapLimit(names, 4, async (name) => {
+      try {
+        return { name, ok: true, result: await this.probeAssetHostKey(actorId, name) }
+      } catch (error) {
+        return { name, ok: false, error: error instanceof Error ? error.message : '主机密钥探测失败' }
+      }
+    })
+  }
+
+  /**
+   * 批量信任主机密钥：admin 专用，只补没有指纹的资产，绝不覆盖已有指纹。
+   * 每个资产都按当前配置重新探测，客户端不能提供指纹；已有指纹的资产一律跳过，
+   * 指纹不一致的必须回到单资产接口带旧指纹确认。跳板机链路同样要求已信任。
+   */
+  async trustAssetHostKeysBatch(
+    actorId: string,
+    input: unknown,
+  ): Promise<{ trusted: string[]; skipped: AssetBatchFailure[]; failed: AssetBatchFailure[] }> {
+    const actor = this.requireActor(actorId)
+    if (!actor.roles.includes('admin')) {
+      throw new PlatformError('只有管理员可以信任 SSH 主机密钥', 403, 'forbidden')
+    }
+    const names = normalizeAssetNames(input, 100)
+    const outcomes = await mapLimit(names, 4, async (name) => {
+      const asset = await this.options.assets.get(name)
+      if (!asset) return { name, kind: 'failed' as const, error: '资产不存在' }
+      if (asset.sshHostKeyFingerprint) {
+        return { name, kind: 'skipped' as const, error: '已有信任指纹，替换需要逐台确认' }
+      }
+      try {
+        const jumps = await resolveJumpTargets(this.options.assets, this.options.credentials, asset)
+        const probed = await probeHostKey(asset, 15_000, undefined, jumps)
+        await this.options.assets.trustHostKey(name, probed.fingerprint)
+        this.dropAssetProbe(name)
+        return { name, kind: 'trusted' as const }
+      } catch (error) {
+        return { name, kind: 'failed' as const, error: error instanceof Error ? error.message : '主机密钥探测失败' }
+      }
+    })
+    const trusted: string[] = []
+    const skipped: AssetBatchFailure[] = []
+    const failed: AssetBatchFailure[] = []
+    for (const item of outcomes) {
+      if (item.kind === 'trusted') trusted.push(item.name)
+      else if (item.kind === 'skipped') skipped.push({ name: item.name, error: item.error })
+      else failed.push({ name: item.name, error: item.error })
+    }
+    return { trusted, skipped, failed }
   }
 
   /**
@@ -1547,6 +1998,7 @@ export class Platform {
         continue
       }
       await this.options.assets.trustHostKey(asset.name, offered)
+      this.dropAssetProbe(asset.name)
       result.applied.push(asset.name)
     }
     return result
@@ -1558,7 +2010,9 @@ export class Platform {
       throw new PlatformError('当前身份不能修改资产', 403, 'forbidden')
     }
     try {
-      return await this.options.assets.remove(name)
+      const removed = await this.options.assets.remove(name)
+      if (removed) this.dropAssetProbe(name)
+      return removed
     } catch (error) {
       throw new PlatformError(error instanceof Error ? error.message : '资产删除失败', 409, 'conflict')
     }
@@ -1597,9 +2051,27 @@ export class Platform {
     const started = Date.now()
     try {
       const result = await testAssetConnection(this.options.assets, this.options.credentials, name)
-      return { ...(result as { ok: true; host: string; port: number; user: string; hostKeyFingerprint?: string; jumps?: string[] }), latencyMs: Date.now() - started }
+      const latencyMs = Date.now() - started
+      const probe = result as { host: string; port: number }
+      // 手动测试也刷新状态列，页面上「测试连接」成功后不必等下一轮后台探测。
+      this.assetProbes.set(name, {
+        name,
+        status: 'up',
+        checkedAt: new Date().toISOString(),
+        target: `${probe.host}:${probe.port}`,
+        latencyMs,
+      })
+      return { ...(result as { ok: true; host: string; port: number; user: string; hostKeyFingerprint?: string; jumps?: string[] }), latencyMs }
     } catch (error) {
-      throw new PlatformError(describeSshConnectError(error), 502, 'ssh_unreachable')
+      const message = describeSshConnectError(error)
+      const blocked = await assetSshBlockedReason(asset, this.options.credentials)
+      this.assetProbes.set(name, {
+        name,
+        status: blocked ? 'unknown' : 'down',
+        checkedAt: new Date().toISOString(),
+        ...(blocked ? { error: blocked, blockedReason: blocked } : { error: message }),
+      })
+      throw new PlatformError(message, 502, 'ssh_unreachable')
     }
   }
 
@@ -1641,6 +2113,7 @@ export class Platform {
     }
     try {
       const trusted = toAssetView(await this.options.assets.trustHostKey(name, normalized, previousFingerprint))
+      this.dropAssetProbe(name)
       if (asset.sshHostKeyFingerprint && asset.sshHostKeyFingerprint !== normalized) {
         this.notify(
           'asset.host_key_changed',
@@ -2449,7 +2922,7 @@ export class Platform {
         },
       })
     }
-    const maxSteps = clampInteger(this.options.agentMaxSteps ?? 8, 1, 30)
+    const maxSteps = clampInteger(this.options.agentMaxSteps ?? 8, 1, 50)
     const outputLimit = clampInteger(this.options.agentToolOutputChars ?? 12_000, 500, 100_000)
     const messages: ChatMessage[] = [
       { role: 'system', content: agentSystemPrompt(skill) },

@@ -18,6 +18,7 @@ description: 分析监控指标（CPU、内存、磁盘、网络、容量、thro
    - 用具体 namespace/pod/node/container label 收窄，先粗后细，不要拉全集群序列。
    - 关注 CPU 使用率与 requests/limits 的比例、throttling、内存 working set 与 OOM、节点 allocatable 压力、磁盘使用率和 inode、网络丢包和重传、容器重启次数。
    - 记录实际使用的 PromQL/MetricsQL、步长、时间范围和单位；只引用明显异常或越过阈值的序列。
+   - 正则转义（高频报错）：双引号字符串按 Go 规则解析，点号要写成 `\\.`，例如 `{instance=~".*17\\.(10|11|12)"}`；也可以改用字符类 `{instance=~".*17[.](10|11|12)"}` 或反引号原始字符串。不要写成 `\.`，否则 VictoriaMetrics 返回 `cannot parse string literal`。返回该错误时按提示修正同一查询，不要换工具或扩大时间窗。
 4. 交叉验证：
    - K8s（`mcp.k8s.*`）：`k8s_get pods`、`k8s_get deployment`、`k8s_get nodes` 确认副本、调度、重启和 HPA；指标里的对象必须能在集群里找到，名字对不上时说明。
    - 日志（`mcp.es.*`）：原因不明时按 `host`/`host_ip`/`ident` 和时间窗查 `mcp.es.search`，验证错误是否集中在同一时间段。

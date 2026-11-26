@@ -3,6 +3,7 @@ import path from 'node:path'
 import { HttpKnowledgeProvider, LocalKnowledgeProvider, type KnowledgeProvider } from '../../extensions/knowledge/src/index.ts'
 import { AlertSourceStore } from './alert-sources.ts'
 import { AssetStore } from './assets.ts'
+import type { AssetProbeResult } from './asset-probe.ts'
 import { createAssetTools } from './asset-tools.ts'
 import { CredentialStore } from './credentials.ts'
 import { McpServerStore, validateMcpServers } from './mcp-servers.ts'
@@ -81,9 +82,11 @@ export async function compose(
   // 启动时触发一次加载，把旧明文敏感字段就地迁移成密文；解密失败直接启动失败，不清空数据。
   await assets.list()
   await credentials.list()
+  // SSH 连接测试缓存由 Platform 写入，asset.list/asset.get 读取，两边必须共用同一个 Map。
+  const assetProbes = new Map<string, AssetProbeResult>()
   const baseTools = [
     ...createKnowledgeTools(knowledge),
-    ...createAssetTools(assets),
+    ...createAssetTools(assets, { probes: assetProbes, credentials }),
     ...createSshTools(assets, credentials),
   ]
   const buildTools = async (
@@ -180,6 +183,7 @@ export async function compose(
     mcpStore,
     assets,
     credentials,
+    assetProbes,
     store,
     rebuildTools: buildTools,
     buildServerTools,
@@ -283,6 +287,19 @@ export async function compose(
     const timer = setInterval(() => {
       void platform.checkMcpHealth().catch(() => undefined)
     }, healthIntervalMs)
+    timer.unref?.()
+  }
+  // 资产连接测试：对配置齐全的资产真实登录一次 SSH（含跳板机和主机密钥校验），
+  // 默认 10 分钟一次，最低 1 分钟；=0 关闭。
+  const probeEnv = Number(process.env.AIOPS_ASSET_PROBE_MS ?? 600_000)
+  const assetProbeMs = Number.isFinite(probeEnv) && probeEnv > 0 ? Math.max(60_000, probeEnv) : 0
+  if (assetProbeMs > 0) {
+    const probe = (): void => {
+      void platform.probeAssets().catch((error) => log.warn('资产连接测试失败', { error }))
+    }
+    const first = setTimeout(probe, 15_000)
+    first.unref?.()
+    const timer = setInterval(probe, assetProbeMs)
     timer.unref?.()
   }
   const host = process.env.AIOPS_HOST || text(config.host ?? '127.0.0.1', 'host')

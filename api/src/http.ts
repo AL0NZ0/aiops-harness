@@ -5,6 +5,7 @@ import { isIP } from 'node:net'
 import { createServer as createHttpsServer } from 'node:https'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { parseAssetWorkbook } from './asset-io.ts'
 import { AuthError, AuthService, hashToken, toPublicUser, type ApiKeyView } from './auth.ts'
 import type { ApiKeyRecord, ApiScope, SessionRecord, UserRecord } from './auth-store.ts'
 import { PlatformError } from './errors.ts'
@@ -575,7 +576,7 @@ function csvCell(value: string | number): string {
   return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
 }
 
-function sendAttachment(res: ServerResponse, filename: string, contentType: string, body: string): void {
+function sendAttachment(res: ServerResponse, filename: string, contentType: string, body: string | Buffer): void {
   res.writeHead(200, {
     'content-type': contentType,
     'content-disposition': `attachment; filename="${filename}"`,
@@ -938,7 +939,16 @@ function match(method: string, pathname: string): { params: Record<string, strin
     { method: 'DELETE', pattern: /^\/api\/knowledge\/docs\/([^/]+)$/, handle: deleteKnowledgeDocument },
     { method: 'GET', pattern: /^\/api\/assets$/, handle: listAssets },
     { method: 'POST', pattern: /^\/api\/assets$/, handle: saveAsset },
+    { method: 'GET', pattern: /^\/api\/assets\/export$/, handle: exportAssets },
+    { method: 'POST', pattern: /^\/api\/assets\/import$/, handle: importAssets },
     { method: 'POST', pattern: /^\/api\/assets\/known-hosts\/import$/, handle: importKnownHosts },
+    // 批量路由必须放在 /api/assets/:name/* 前面，否则 batch 会被当成资产名。
+    { method: 'POST', pattern: /^\/api\/assets\/batch\/ssh-test$/, handle: testAssetsSsh },
+    { method: 'POST', pattern: /^\/api\/assets\/batch\/host-key$/, handle: probeAssetsHostKey },
+    { method: 'POST', pattern: /^\/api\/assets\/batch\/host-key\/trust$/, handle: trustAssetsHostKey },
+    { method: 'POST', pattern: /^\/api\/assets\/batch\/delete$/, handle: deleteAssets },
+    { method: 'POST', pattern: /^\/api\/assets\/batch\/credential$/, handle: assignAssetsCredential },
+    { method: 'POST', pattern: /^\/api\/assets\/batch\/jump$/, handle: assignAssetsJump },
     { method: 'POST', pattern: /^\/api\/assets\/([^/]+)\/ssh-test$/, handle: testAssetSsh },
     { method: 'POST', pattern: /^\/api\/assets\/([^/]+)\/ssh-host-key\/probe$/, handle: probeAssetHostKey },
     { method: 'POST', pattern: /^\/api\/assets\/([^/]+)\/ssh-host-key\/trust$/, handle: trustAssetHostKey },
@@ -1487,7 +1497,106 @@ async function document(ctx: Ctx): Promise<void> {
 }
 
 async function listAssets(ctx: Ctx): Promise<void> {
-  sendJson(ctx.res, 200, { assets: await ctx.platform.listAssets(ctx.actorId) })
+  const assets = await ctx.platform.listAssets(ctx.actorId)
+  sendJson(ctx.res, 200, { assets, probes: ctx.platform.listAssetProbes(ctx.actorId) })
+}
+
+/** 导出资产表；空平台导出的就是模板。 */
+async function exportAssets(ctx: Ctx): Promise<void> {
+  const buffer = await ctx.platform.exportAssetsWorkbook(ctx.actorId)
+  const stamp = new Date().toISOString().slice(0, 10)
+  await auditConfig(ctx, 'assets_exported', { bytes: buffer.length })
+  sendAttachment(
+    ctx.res,
+    `assets-${stamp}.xlsx`,
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    buffer,
+  )
+}
+
+/** 导入资产表：逐行写入，失败行只记日志不中断后续。 */
+async function importAssets(ctx: Ctx): Promise<void> {
+  const body = await readJson(ctx.req, 8_000_000)
+  const file = stringField(body, 'file') ?? ''
+  if (!file.trim()) throw new PlatformError('file 不能为空', 400, 'bad_request')
+  const base64 = file.includes('base64,') ? file.slice(file.indexOf('base64,') + 7) : file
+  const buffer = Buffer.from(base64, 'base64')
+  if (!buffer.length) throw new PlatformError('文件为空或不是有效的 base64', 400, 'bad_request')
+  if (buffer.length > 5_000_000) throw new PlatformError('表格文件不能超过 5MB', 413, 'payload_too_large')
+  let rows
+  try {
+    rows = await parseAssetWorkbook(buffer)
+  } catch (error) {
+    throw new PlatformError(`表格解析失败：${error instanceof Error ? error.message : '未知错误'}`, 400, 'bad_request')
+  }
+  const mode = body.mode === 'overwrite' ? 'overwrite' : 'skip'
+  const result = await ctx.platform.importAssets(ctx.actorId, rows, mode)
+  await auditConfig(ctx, 'assets_imported', {
+    mode,
+    total: result.total,
+    imported: result.imported,
+    failed: result.failed,
+  })
+  sendJson(ctx.res, 200, { result })
+}
+
+async function assignAssetsJump(ctx: Ctx): Promise<void> {
+  const body = await readJson(ctx.req)
+  const jumpAsset = stringField(body, 'jumpAsset') ?? ''
+  const result = await ctx.platform.assignAssetJump(ctx.actorId, body.names, jumpAsset)
+  await auditConfig(ctx, 'asset_jumps_assigned', {
+    jumpAsset: jumpAsset || null,
+    updated: result.updated.length,
+    failed: result.failed.length,
+  })
+  sendJson(ctx.res, 200, result)
+}
+
+async function testAssetsSsh(ctx: Ctx): Promise<void> {
+  const body = await readJson(ctx.req)
+  const results = await ctx.platform.testAssetsSsh(ctx.actorId, body.names)
+  await auditConfig(ctx, 'asset_ssh_tested_batch', {
+    count: results.length,
+    ok: results.filter((item) => item.ok).length,
+    failed: results.filter((item) => !item.ok).length,
+  })
+  sendJson(ctx.res, 200, { results })
+}
+
+async function probeAssetsHostKey(ctx: Ctx): Promise<void> {
+  const body = await readJson(ctx.req)
+  const results = await ctx.platform.probeAssetsHostKey(ctx.actorId, body.names)
+  sendJson(ctx.res, 200, { results })
+}
+
+async function trustAssetsHostKey(ctx: Ctx): Promise<void> {
+  const body = await readJson(ctx.req)
+  const result = await ctx.platform.trustAssetHostKeysBatch(ctx.actorId, body.names)
+  await auditConfig(ctx, 'asset_host_keys_trusted_batch', {
+    trusted: result.trusted.length,
+    skipped: result.skipped.length,
+    failed: result.failed.length,
+  })
+  sendJson(ctx.res, 200, result)
+}
+
+async function deleteAssets(ctx: Ctx): Promise<void> {
+  const body = await readJson(ctx.req)
+  const result = await ctx.platform.deleteAssets(ctx.actorId, body.names)
+  await auditConfig(ctx, 'assets_deleted', { deleted: result.deleted.length, failed: result.failed.length })
+  sendJson(ctx.res, 200, result)
+}
+
+async function assignAssetsCredential(ctx: Ctx): Promise<void> {
+  const body = await readJson(ctx.req)
+  const credentialId = stringField(body, 'credentialId') ?? ''
+  const result = await ctx.platform.assignAssetCredential(ctx.actorId, body.names, credentialId)
+  await auditConfig(ctx, 'asset_credentials_assigned', {
+    credentialId: credentialId || null,
+    updated: result.updated.length,
+    failed: result.failed.length,
+  })
+  sendJson(ctx.res, 200, result)
 }
 
 async function saveAsset(ctx: Ctx): Promise<void> {
@@ -1510,6 +1619,7 @@ async function saveAsset(ctx: Ctx): Promise<void> {
     sshPort,
     sshUser: stringField(body, 'sshUser'),
     sshCredentialId: stringField(body, 'sshCredentialId'),
+    sshJumpAsset: stringField(body, 'sshJumpAsset'),
     sshPassword: stringField(body, 'sshPassword'),
     sshKey: stringField(body, 'sshKey'),
     sshPassphrase: stringField(body, 'sshPassphrase'),
@@ -1738,16 +1848,16 @@ async function streamEvents(ctx: Ctx, taskId: string): Promise<void> {
   })
 }
 
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
-  const parsed = await readJsonValue(req)
+async function readJson(req: IncomingMessage, limit = 1_000_000): Promise<Record<string, unknown>> {
+  const parsed = await readJsonValue(req, limit)
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new PlatformError('JSON 必须是对象', 400, 'bad_json')
   }
   return parsed as Record<string, unknown>
 }
 
-async function readJsonValue(req: IncomingMessage): Promise<unknown> {
-  const text = await readBody(req)
+async function readJsonValue(req: IncomingMessage, limit = 1_000_000): Promise<unknown> {
+  const text = await readBody(req, limit)
   if (!text.trim()) return {}
   try {
     return JSON.parse(text) as unknown
@@ -1756,13 +1866,13 @@ async function readJsonValue(req: IncomingMessage): Promise<unknown> {
   }
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
+function readBody(req: IncomingMessage, limit = 1_000_000): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     let size = 0
     req.on('data', (chunk: Buffer) => {
       size += chunk.length
-      if (size > 1_000_000) {
+      if (size > limit) {
         reject(new PlatformError('请求体过大', 413, 'payload_too_large'))
         req.destroy()
         return
