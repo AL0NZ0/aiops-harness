@@ -450,9 +450,16 @@
     "/api/v1/approvals/{approvalId}": {
       "get": {
         "summary": "读取审批和执行结果",
-        "description": "execution.status 为 succeeded/failed/unknown 时，取 execution.result 或 execution.error。审批被拒绝时 status 为 rejected。",
+        "description": "execution.status 为 succeeded/failed/unknown 时，取 execution.result 或 execution.error。审批被拒绝时 status 为 rejected。可选 waitMs 阻塞等待审批结论和自动执行结果，超时返回当前状态并带 timedOut=true。",
         "parameters": [
-          { "name": "approvalId", "in": "path", "required": true, "schema": { "type": "string" } }
+          { "name": "approvalId", "in": "path", "required": true, "schema": { "type": "string" } },
+          {
+            "name": "waitMs",
+            "in": "query",
+            "required": false,
+            "description": "等待审批和执行结果的最长毫秒数，0-120000，默认 0（立即返回）。",
+            "schema": { "type": "integer", "minimum": 0, "maximum": 120000, "default": 0 }
+          }
         ],
         "responses": {
           "200": {
@@ -472,6 +479,10 @@
                         "error": { "type": "string" },
                         "auditId": { "type": "string" }
                       }
+                    },
+                    "timedOut": {
+                      "type": "boolean",
+                      "description": "仅在使用 waitMs 且等待超时时出现；此时审批或自动执行可能仍在进行。"
                     }
                   }
                 }

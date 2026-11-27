@@ -1181,8 +1181,19 @@ async function listApprovals(ctx: Ctx): Promise<void> {
 }
 
 async function getApproval(ctx: Ctx): Promise<void> {
-  const detail = await ctx.platform.getApprovalDetail(ctx.actorId, ctx.params.id ?? '')
-  sendJson(ctx.res, 200, { approval: detail.approval, execution: detail.execution })
+  const rawWait = ctx.url.searchParams.get('waitMs')
+  let waitMs = 0
+  if (rawWait !== null && rawWait !== '') {
+    const parsed = Number(rawWait)
+    if (!Number.isFinite(parsed) || parsed < 0) throw new PlatformError('waitMs 必须是 0 到 120000 之间的整数', 400, 'invalid_wait_ms')
+    waitMs = Math.min(120_000, Math.floor(parsed))
+  }
+  const detail = await ctx.platform.getApprovalDetail(ctx.actorId, ctx.params.id ?? '', waitMs)
+  sendJson(ctx.res, 200, {
+    approval: detail.approval,
+    execution: detail.execution,
+    ...(detail.timedOut ? { timedOut: true } : {}),
+  })
 }
 
 async function decide(ctx: Ctx): Promise<void> {

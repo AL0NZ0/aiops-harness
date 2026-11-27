@@ -6,6 +6,7 @@ import { LocalKnowledgeProvider } from '../../extensions/knowledge/src/index.ts'
 import { AssetStore } from '../src/assets.ts'
 import { CredentialStore } from '../src/credentials.ts'
 import { createServer } from '../src/http.ts'
+import { mcpSessionLimits } from '../src/mcp-http.ts'
 import { McpServerStore } from '../src/mcp-servers.ts'
 import { Platform } from '../src/platform.ts'
 import { loadSkills } from '../src/skills.ts'
@@ -90,6 +91,23 @@ async function rpc(
   }
 }
 
+test('MCP 会话回收参数可配置，非法值回退默认', () => {
+  const defaults = { ttlMs: 12 * 60 * 60_000, maxSessions: 200 }
+  assert.deepEqual(mcpSessionLimits({}), defaults)
+  assert.deepEqual(mcpSessionLimits({ AIOPS_MCP_SESSION_TTL_MS: '3600000', AIOPS_MCP_MAX_SESSIONS: '50' }), {
+    ttlMs: 3_600_000,
+    maxSessions: 50,
+  })
+  // 0 表示不按时间回收，只受会话数上限约束；上限 0 视为非法，回退默认。
+  assert.deepEqual(mcpSessionLimits({ AIOPS_MCP_SESSION_TTL_MS: '0', AIOPS_MCP_MAX_SESSIONS: '0' }), {
+    ttlMs: 0,
+    maxSessions: 200,
+  })
+  assert.deepEqual(mcpSessionLimits({ AIOPS_MCP_SESSION_TTL_MS: 'abc' }), defaults)
+  assert.equal(mcpSessionLimits({ AIOPS_MCP_SESSION_TTL_MS: '1' }).ttlMs, 60_000)
+  assert.equal(mcpSessionLimits({ AIOPS_MCP_SESSION_TTL_MS: String(30 * 24 * 60 * 60_000) }).ttlMs, 7 * 24 * 60 * 60_000)
+})
+
 test('远程 MCP：initialize 分配会话，任务、只读和变更工具走同一套审批', async () => {
   const ctx = await boot()
   try {
@@ -157,6 +175,62 @@ test('远程 MCP：initialize 分配会话，任务、只读和变更工具走�
     // 工具没有直接执行。
     const task = await ctx.platform.getTask('alice', taskBody.task.id)
     assert.equal(task.status, 'awaiting_approval')
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('远程 MCP：approval.get 返回执行结果，并支持 wait_ms 阻塞等待', async () => {
+  const ctx = await boot()
+  try {
+    const init = await rpc(ctx.base, { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })
+    const session = init.session!
+    const call = async (id: number, name: string, args: Record<string, unknown>) => {
+      const response = await rpc(
+        ctx.base,
+        { jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } },
+        session,
+      )
+      return JSON.parse((response.body.result as { content: Array<{ text: string }> }).content[0]!.text) as Record<
+        string,
+        unknown
+      >
+    }
+
+    await call(2, 'task.create', { prompt: '重启 checkout-api' })
+    const mutate = await call(3, 'demo.restart', { namespace: 'shop' })
+    assert.equal(mutate.status, 'awaiting_approval')
+    const approvalId = mutate.approvalId as string
+    assert.ok(approvalId)
+
+    const pending = await call(4, 'approval.get', { approval_id: approvalId })
+    assert.equal((pending.approval as { status: string }).status, 'pending')
+    assert.equal((pending.execution as { status: string }).status, 'pending')
+
+    const started = Date.now()
+    const waited = await call(5, 'approval.get', { approval_id: approvalId, wait_ms: 300 })
+    assert.ok(Date.now() - started >= 250, 'wait_ms 应该阻塞到超时')
+    assert.equal(waited.timedOut, true)
+    assert.equal((waited.approval as { status: string }).status, 'pending')
+
+    await ctx.platform.decideApproval('bob', approvalId, 'approved')
+    const done = await call(6, 'approval.get', { approval_id: approvalId, wait_ms: 5000 })
+    assert.equal(done.timedOut, undefined)
+    assert.equal((done.approval as { status: string }).status, 'approved')
+    assert.equal((done.execution as { status: string }).status, 'succeeded')
+    assert.deepEqual((done.execution as { result: unknown }).result, { restarted: true })
+
+    const bad = await rpc(
+      ctx.base,
+      {
+        jsonrpc: '2.0',
+        id: 7,
+        method: 'tools/call',
+        params: { name: 'approval.get', arguments: { approval_id: approvalId, wait_ms: 120001 } },
+      },
+      session,
+    )
+    assert.equal((bad.body.result as { isError: boolean }).isError, true)
   } finally {
     await ctx.close()
   }

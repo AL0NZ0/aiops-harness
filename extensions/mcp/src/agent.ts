@@ -11,7 +11,7 @@ export interface AgentToolApi {
   getTask(taskId: string): Promise<unknown>
   cancelTask(taskId: string, input: { force?: boolean }): Promise<unknown>
   listApprovals(status?: string): Promise<unknown>
-  getApproval(approvalId: string): Promise<unknown>
+  getApproval(approvalId: string, waitMs?: number): Promise<unknown>
   resumeApproval(approvalId: string): Promise<unknown>
   executeTool(input: { tool: string; args?: Record<string, unknown>; taskId?: string }): Promise<unknown>
 }
@@ -108,11 +108,18 @@ export const AGENT_TOOLS: McpToolInfo[] = [
   },
   {
     name: 'approval.get',
-    description: '查看审批状态、决定和平台自动执行的结果（含审计号）。审批通过后用这个工具获取变更结果，不要重复调用变更工具。',
+    description:
+      '查看审批状态、决定和平台自动执行的结果（含审计号）。审批通过后用这个工具获取变更结果，不要重复调用变更工具。传 wait_ms 可以阻塞等待审批和自动执行完成，用户点「审批完成」后调用一次即可，最多等 120000 毫秒；超时返回 timedOut=true，审批仍可能处于 pending。',
     parameters: {
       type: 'object',
       properties: {
         approval_id: { type: 'string' },
+        wait_ms: {
+          type: 'integer',
+          minimum: 0,
+          maximum: 120000,
+          description: '可选，等待审批和执行结果的最长毫秒数，默认 0 立即返回。',
+        },
       },
       required: ['approval_id'],
     },
@@ -262,7 +269,12 @@ export function createAgentSession(api: AgentToolApi, options: AgentSessionOptio
   }
 
   async function getApproval(args: Record<string, unknown>): Promise<{ text: string; isError: boolean }> {
-    const body = await api.getApproval(stringArg(args, 'approval_id'))
+    const approvalId = stringArg(args, 'approval_id')
+    const waitMs = optionalNumberArg(args, 'wait_ms')
+    if (waitMs !== undefined && (waitMs < 0 || waitMs > 120_000)) {
+      throw new Error('参数 wait_ms 必须在 0 到 120000 之间')
+    }
+    const body = await api.getApproval(approvalId, waitMs)
     return { text: JSON.stringify(body), isError: false }
   }
 
@@ -302,7 +314,7 @@ export function createAgentSession(api: AgentToolApi, options: AgentSessionOptio
       ? JSON.stringify({
           ...asRecord(body),
           message:
-            '变更已提交人工审批，任务保持等待。不要重复调用该变更，也不要调用 task.cancel；结束当前回合，用户审批后用 approval.get 查询结果，再 task.finish。',
+            '变更已提交人工审批，任务保持等待。不要重复调用该变更，也不要调用 task.cancel；结束当前回合，等用户确认审批完成后，用 approval.get（建议带 wait_ms=30000）获取执行结果，再 task.finish。',
         })
       : JSON.stringify(body)
     return { text, isError: status === 'error' || status === 'denied' }
@@ -333,6 +345,13 @@ function optionalStringArg(args: Record<string, unknown>, key: string): string |
   if (typeof value !== 'string') throw new Error(`参数 ${key} 必须是字符串`)
   const text = value.trim()
   return text || undefined
+}
+
+function optionalNumberArg(args: Record<string, unknown>, key: string): number | undefined {
+  const value = args[key]
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`参数 ${key} 必须是数字`)
+  return Math.floor(value)
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

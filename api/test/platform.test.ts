@@ -1549,6 +1549,47 @@ test('DSH 任务从创建到审批续跑走同一条链', async () => {
   }
 })
 
+test('审批详情支持 waitMs 等待结论和执行结果', async () => {
+  const ctx = await boot()
+  try {
+    const created = await api(ctx.base, 'alice', 'POST', '/api/agent/tasks', {
+      prompt: '请重启 checkout-api',
+      sessionId: 'dsh-session-wait',
+    }, { 'x-internal-token': 'test-token' })
+    const taskId = created.body.task.id as string
+    const mutate = await api(ctx.base, 'alice', 'POST', '/api/tool-calls', {
+      tool: 'demo.restart',
+      args: { namespace: 'shop', name: 'checkout-api' },
+      taskId,
+    }, { 'x-internal-token': 'test-token' })
+    const approvalId = mutate.body.approvalId as string
+
+    assert.equal((await api(ctx.base, 'alice', 'GET', `/api/approvals/${approvalId}?waitMs=-1`)).status, 400)
+    assert.equal((await api(ctx.base, 'alice', 'GET', `/api/approvals/${approvalId}?waitMs=abc`)).status, 400)
+
+    const started = Date.now()
+    const pending = await api(ctx.base, 'alice', 'GET', `/api/approvals/${approvalId}?waitMs=200`)
+    assert.ok(Date.now() - started >= 150, 'waitMs 应该阻塞到超时')
+    assert.equal(pending.body.timedOut, true)
+    assert.equal(pending.body.approval.status, 'pending')
+    assert.equal(pending.body.execution.status, 'pending')
+
+    assert.equal((await api(ctx.base, 'bob', 'POST', `/api/approvals/${approvalId}`, {
+      decision: 'approved',
+    })).status, 200)
+
+    // 审批和执行都已完成时立即返回，不再等待。
+    const startedDone = Date.now()
+    const done = await api(ctx.base, 'alice', 'GET', `/api/approvals/${approvalId}?waitMs=5000`)
+    assert.ok(Date.now() - startedDone < 4000)
+    assert.equal(done.body.timedOut, undefined)
+    assert.equal(done.body.execution.status, 'succeeded')
+    assert.ok(done.body.execution.result)
+  } finally {
+    await ctx.close()
+  }
+})
+
 test('DSH 审批被拒绝后任务标失败且不改集群', async () => {
   const ctx = await boot()
   try {

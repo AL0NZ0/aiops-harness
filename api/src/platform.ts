@@ -144,6 +144,13 @@ function isExternalTask(task: Task): boolean {
   return task.origin === 'dsh' || task.origin === 'api'
 }
 
+/** 审批还没结论，或者已通过但执行结果还没回写时，approval.get 的等待继续轮询。 */
+function approvalExecutionPending(detail: ApprovalDetail): boolean {
+  if (detail.approval.status === 'pending') return true
+  if (detail.approval.status !== 'approved') return false
+  return detail.execution.status === 'pending' || detail.execution.status === 'approved'
+}
+
 function outcomeText(outcome: ToolOutcome): string {
   if (outcome.status === 'error') return outcome.error
   if (outcome.status === 'denied') return outcome.reason
@@ -514,6 +521,8 @@ export interface ApprovalExecution {
 export interface ApprovalDetail {
   approval: Approval
   execution: ApprovalExecution
+  /** 带 waitMs 等待时，超时仍未拿到执行结果会置 true；审批状态本身不变。 */
+  timedOut?: boolean
 }
 
 export interface CreateTaskInput {
@@ -1275,7 +1284,19 @@ export class Platform {
    * 审批结果回传：DSH 模型在审批通过后用它获取自动执行的结果，
    * 不需要也不应该重新调用变更工具。执行结果来自任务里的 tool.result 事件。
    */
-  async getApprovalDetail(actorId: string, approvalId: string): Promise<ApprovalDetail> {
+  async getApprovalDetail(actorId: string, approvalId: string, waitMs = 0): Promise<ApprovalDetail> {
+    const wait = Number.isFinite(waitMs) ? Math.min(120_000, Math.max(0, Math.floor(waitMs))) : 0
+    if (wait === 0) return this.readApprovalDetail(actorId, approvalId)
+    const deadline = Date.now() + wait
+    for (;;) {
+      const detail = await this.readApprovalDetail(actorId, approvalId)
+      if (!approvalExecutionPending(detail)) return detail
+      if (Date.now() >= deadline) return { ...detail, timedOut: true }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(500, deadline - Date.now())))
+    }
+  }
+
+  private async readApprovalDetail(actorId: string, approvalId: string): Promise<ApprovalDetail> {
     const approval = await this.getApproval(actorId, approvalId)
     if (approval.status === 'pending') {
       return { approval, execution: { status: 'pending' } }

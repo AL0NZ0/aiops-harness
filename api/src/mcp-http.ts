@@ -2,20 +2,50 @@ import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { createAgentSession, type AgentSession, type AgentToolApi } from '../../extensions/mcp/src/agent.ts'
 import { handleMcpMessage } from '../../extensions/mcp/src/protocol.ts'
+import { log } from './log.ts'
 import type { Platform } from './platform.ts'
 
 /**
  * 远程 DSH 接入：把 stdio 代理同一套 Agent 工具包成 MCP Streamable HTTP。
  * 认证由 http.ts 统一完成（API key 或网页会话），这里只按会话隔离任务上下文。
+ *
+ * 会话只存在进程内存：DSH 桌面端经常把会话闲置几小时，30 分钟 TTL 太短，
+ * 过期后客户端没按 MCP 规范重新 initialize，所有工具都会报 -32000。
+ * 默认放宽到 12 小时，可用环境变量调整；会话数上限默认 200。
  */
-const SESSION_TTL_MS = 30 * 60_000
-const MAX_SESSIONS = 100
+const DEFAULT_SESSION_TTL_MS = 12 * 60 * 60_000
+const MIN_SESSION_TTL_MS = 60_000
+const MAX_SESSION_TTL_MS = 7 * 24 * 60 * 60_000
+const DEFAULT_MAX_SESSIONS = 200
+const MAX_SESSIONS_LIMIT = 1_000
 const MAX_BODY_BYTES = 1_000_000
 
 interface SessionEntry {
   actorId: string
   session: AgentSession
   lastSeen: number
+}
+
+export interface McpSessionLimits {
+  /** 0 表示不按时间回收，只受 maxSessions 限制。 */
+  ttlMs: number
+  maxSessions: number
+}
+
+/** 解析会话回收参数，非法值回退默认，避免配置写错把会话立刻清光。 */
+export function mcpSessionLimits(env: NodeJS.ProcessEnv = process.env): McpSessionLimits {
+  const ttlRaw = env.AIOPS_MCP_SESSION_TTL_MS
+  const ttl = ttlRaw === undefined ? DEFAULT_SESSION_TTL_MS : Number(ttlRaw)
+  const ttlMs =
+    ttlRaw !== undefined && ttl === 0
+      ? 0
+      : Number.isFinite(ttl) && ttl > 0
+        ? Math.min(MAX_SESSION_TTL_MS, Math.max(MIN_SESSION_TTL_MS, ttl))
+        : DEFAULT_SESSION_TTL_MS
+  const max = Number(env.AIOPS_MCP_MAX_SESSIONS ?? DEFAULT_MAX_SESSIONS)
+  const maxSessions =
+    Number.isFinite(max) && max >= 1 ? Math.min(MAX_SESSIONS_LIMIT, Math.floor(max)) : DEFAULT_MAX_SESSIONS
+  return { ttlMs, maxSessions }
 }
 
 export interface McpEndpoint {
@@ -25,10 +55,13 @@ export interface McpEndpoint {
 
 export function createMcpEndpoint(platform: Platform): McpEndpoint {
   const sessions = new Map<string, SessionEntry>()
+  const { ttlMs, maxSessions } = mcpSessionLimits()
   const cleanup = () => {
-    const cutoff = Date.now() - SESSION_TTL_MS
+    if (ttlMs <= 0) return
+    const cutoff = Date.now() - ttlMs
     for (const [id, entry] of sessions) {
       if (entry.lastSeen < cutoff) {
+        log.info('MCP 会话超时回收', { sessionId: id.slice(0, 8), idleMs: Date.now() - entry.lastSeen })
         void entry.session.dispose()
         sessions.delete(id)
       }
@@ -38,11 +71,12 @@ export function createMcpEndpoint(platform: Platform): McpEndpoint {
   timer.unref?.()
 
   function prune(): void {
-    if (sessions.size <= MAX_SESSIONS) return
+    if (sessions.size <= maxSessions) return
     const oldest = [...sessions.entries()].sort((a, b) => a[1].lastSeen - b[1].lastSeen)
-    while (sessions.size > MAX_SESSIONS && oldest.length > 0) {
+    while (sessions.size > maxSessions && oldest.length > 0) {
       const entry = oldest.shift()
       if (!entry) break
+      log.warn('MCP 会话超过上限被淘汰', { sessionId: entry[0].slice(0, 8), maxSessions })
       void entry[1].session.dispose()
       sessions.delete(entry[0])
     }
@@ -106,6 +140,12 @@ export function createMcpEndpoint(platform: Platform): McpEndpoint {
     }
     const entry = sessions.get(sessionId)
     if (!entry) {
+      log.warn('MCP 会话不存在或已过期', {
+        sessionId: sessionId.slice(0, 8),
+        method: typeof record.method === 'string' ? record.method : undefined,
+        activeSessions: sessions.size,
+        ttlMs,
+      })
       sendRpcError(res, 404, record.id ?? null, -32000, 'MCP 会话不存在或已过期，请重新 initialize')
       return
     }
@@ -175,7 +215,7 @@ function platformApi(platform: Platform, actorId: string): AgentToolApi {
       const approvals = await platform.listApprovals(actorId, status)
       return { approvals, total: approvals.length }
     },
-    getApproval: async (approvalId) => ({ approval: await platform.getApproval(actorId, approvalId) }),
+    getApproval: (approvalId, waitMs) => platform.getApprovalDetail(actorId, approvalId, waitMs ?? 0),
     resumeApproval: (approvalId) => platform.resumeApproval(actorId, approvalId),
     executeTool: (input) =>
       platform.executeTool({

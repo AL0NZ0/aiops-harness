@@ -66,7 +66,10 @@ const agentApi: AgentToolApi = {
       body: { force: input.force === true },
     }),
   listApprovals: (status) => request(`/api/approvals${status ? `?status=${encodeURIComponent(status)}` : ''}`),
-  getApproval: (approvalId) => request(`/api/approvals/${encodeURIComponent(approvalId)}`),
+  getApproval: (approvalId, waitMs) =>
+    request(
+      `/api/approvals/${encodeURIComponent(approvalId)}${waitMs && waitMs > 0 ? `?waitMs=${Math.floor(waitMs)}` : ''}`,
+    ),
   resumeApproval: (approvalId) =>
     request(`/api/approvals/${encodeURIComponent(approvalId)}/resume`, { method: 'POST', internal: true }),
   executeTool: (input) =>
