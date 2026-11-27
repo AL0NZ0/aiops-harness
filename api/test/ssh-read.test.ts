@@ -14,7 +14,10 @@ import { McpServerStore } from '../src/mcp-servers.ts'
 import { Platform } from '../src/platform.ts'
 import { SecretBox } from '../src/secret-box.ts'
 import {
+  buildCatArgv,
+  buildListArgv,
   buildLogsArgv,
+  buildStatArgv,
   normalizeLogLines,
   normalizeLogPattern,
   normalizeReadPath,
@@ -46,6 +49,7 @@ test('只读命令白名单允许系统诊断，拒绝任意命令', () => {
   ])
   assert.deepEqual(parseReadCommand('journalctl -u sshd -n 50 --no-pager'), ['journalctl', '-u', 'sshd', '-n', '50', '--no-pager'])
   assert.deepEqual(parseReadCommand('cat /proc/loadavg'), ['cat', '/proc/loadavg'])
+  assert.deepEqual(parseReadCommand('docker version'), ['docker', 'version'])
 
   for (const command of [
     'rm -rf /',
@@ -62,8 +66,12 @@ test('只读命令白名单允许系统诊断，拒绝任意命令', () => {
     'journalctl -p err -n 501 --no-pager',
     'journalctl --vacuum-time=1s',
   ]) {
-    assert.throws(() => parseReadCommand(command), /白名单|不允许/, command)
+    assert.throws(() => parseReadCommand(command), /白名单|不允许|固定模板/, command)
   }
+  // 拒绝信息要能直接告诉模型下一步，避免它换写法反复试探
+  assert.throws(() => parseReadCommand('docker info'), /ssh\.exec/)
+  assert.throws(() => parseReadCommand('systemctl status docker'), /--no-pager/)
+  assert.throws(() => parseReadCommand('journalctl -u docker --no-pager'), /固定模板/)
 })
 
 test('命令里的 shell 元字符一律拒绝', () => {
@@ -125,6 +133,9 @@ test('日志行数、grep 和 argv 有边界', () => {
   assert.deepEqual(buildLogsArgv('/srv/logs/app.log', 20, 'error'), [
     'grep', '-F', '-m', '20', '--', 'error', '/srv/logs/app.log',
   ])
+  assert.deepEqual(buildListArgv('/srv/logs'), ['ls', '-lA', '--', '/srv/logs'])
+  assert.deepEqual(buildCatArgv('/srv/logs/daemon.json'), ['cat', '--', '/srv/logs/daemon.json'])
+  assert.deepEqual(buildStatArgv('/srv/logs'), ['stat', '-L', '-c', '%F %s', '--', '/srv/logs'])
 })
 
 function respond(command: string): { code: number; out: string; err?: string } {
@@ -136,6 +147,17 @@ function respond(command: string): { code: number; out: string; err?: string } {
   if (command === 'readlink -f -- /srv/logs/escape.log') return { code: 0, out: '/etc/passwd\n' }
   if (command === 'readlink -f -- /srv/logs/dir') return { code: 0, out: '/srv/logs/dir\n' }
   if (command === 'stat -L -c %F -- /srv/logs/dir') return { code: 0, out: 'directory\n' }
+  if (command === 'readlink -f -- /srv/logs') return { code: 0, out: '/srv/logs\n' }
+  if (command === 'stat -L -c %F %s -- /srv/logs') return { code: 0, out: 'directory 4096\n' }
+  if (command === 'ls -lA -- /srv/logs') {
+    return { code: 0, out: 'total 8\n-rw-r--r-- 1 root root 27 Nov 26 10:00 daemon.json\n' }
+  }
+  if (command === 'readlink -f -- /srv/logs/daemon.json') return { code: 0, out: '/srv/logs/daemon.json\n' }
+  if (command === 'readlink -f -- /srv/logs/big.log') return { code: 0, out: '/srv/logs/big.log\n' }
+  if (command === 'stat -L -c %F %s -- /srv/logs/daemon.json') return { code: 0, out: 'regular file 27\n' }
+  if (command === 'stat -L -c %F %s -- /srv/logs/big.log') return { code: 0, out: 'regular file 70000\n' }
+  if (command === 'stat -L -c %F %s -- /srv/logs/app.log') return { code: 0, out: 'regular file 18\n' }
+  if (command === 'cat -- /srv/logs/daemon.json') return { code: 0, out: '{"log-driver":"json-file"}\n' }
   return { code: 127, out: '', err: `unexpected command: ${command}` }
 }
 
@@ -287,6 +309,59 @@ test('ssh.logs 读取已授权文件，支持 grep，拒绝软链逃逸和非普
     await ctx.cleanup()
   }
 })
+test('ssh.ls 和 ssh.cat 复用 sshReadPaths，只读并拒绝越界和类型不符', async () => {
+  const ctx = await setup()
+  try {
+    const ls = ctx.tools.find((item) => item.name === 'ssh.ls')!
+    const cat = ctx.tools.find((item) => item.name === 'ssh.cat')!
+    assert.equal(ls.risk, 'read')
+    assert.equal(cat.risk, 'read')
+
+    const listed = (await ls.execute({ asset: 'host01', path: '/srv/logs' }, { actorId: 'alice' })) as {
+      stdout: string
+      path: string
+      command: string
+    }
+    assert.equal(listed.path, '/srv/logs')
+    assert.match(listed.stdout, /daemon\.json/)
+    assert.equal(listed.command, 'ls -lA -- /srv/logs')
+
+    const content = (await cat.execute({ asset: 'host01', path: '/srv/logs/daemon.json' }, { actorId: 'alice' })) as {
+      stdout: string
+      path: string
+      bytes: number
+      command: string
+    }
+    assert.equal(content.stdout, '{"log-driver":"json-file"}\n')
+    assert.equal(content.path, '/srv/logs/daemon.json')
+    assert.equal(content.bytes, 27)
+    assert.equal(content.command, 'cat -- /srv/logs/daemon.json')
+
+    await assert.rejects(
+      () => Promise.resolve(ls.validate!({ asset: 'host01', path: '/etc' })),
+      /允许的只读范围/,
+    )
+    await assert.rejects(
+      () => Promise.resolve(cat.validate!({ asset: 'host01', path: '/etc/passwd' })),
+      /允许的只读范围/,
+    )
+    await assert.rejects(
+      () => ls.execute({ asset: 'host01', path: '/srv/logs/app.log' }, { actorId: 'alice' }),
+      /只能列目录/,
+    )
+    await assert.rejects(
+      () => cat.execute({ asset: 'host01', path: '/srv/logs' }, { actorId: 'alice' }),
+      /只能读取普通文件/,
+    )
+    await assert.rejects(
+      () => cat.execute({ asset: 'host01', path: '/srv/logs/big.log' }, { actorId: 'alice' }),
+      /超过 ssh\.cat 上限/,
+    )
+  } finally {
+    await ctx.cleanup()
+  }
+})
+
 test('资产连接测试真实登录并鉴权，未信任指纹和权限不足时拒绝', async () => {
   const ctx = await setup()
   try {

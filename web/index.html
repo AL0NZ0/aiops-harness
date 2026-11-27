@@ -355,7 +355,7 @@
           </label>
         </div>
         <p class="hint">密码和私钥在「密码私钥管理」创建；这里只选一个凭证，不能同时填写密码和私钥。<button type="button" class="link" data-goto-view="credentials">去创建凭证</button> 修改主机、IP 或 SSH 端口会清除已信任的主机密钥，需要重新校验。跳板机本身也必须是已信任主机密钥的完整资产，最多 4 层。</p>
-        <label id="asset-read-paths" hidden>SSH 只读日志路径（每行一个绝对路径，仅管理员可改）
+        <label id="asset-read-paths" hidden>SSH 只读路径（ssh.logs / ssh.cat / ssh.ls 共用，每行一个绝对路径，仅管理员可改）
           <textarea name="sshReadPaths" rows="3" placeholder="/var/log/nginx&#10;/opt/app/logs" spellcheck="false"></textarea>
         </label>
         <p class="hint">只写在这里的路径可以被 <code>ssh.logs</code> 读取（按文件精确匹配或目录前缀匹配）；留空表示不开放文件日志读取。软链会先解析再校验，真实路径也必须在允许范围内。</p>

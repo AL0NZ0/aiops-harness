@@ -3,11 +3,15 @@ import { Client, type ClientChannel } from 'ssh2'
 import { toAssetView, type AssetRecord, type AssetStore } from './assets.ts'
 import type { CredentialStore } from './credentials.ts'
 import {
+  SSH_CAT_MAX_BYTES,
   SSH_LOGS_MAX_LINES,
   SSH_READ_MAX_OUTPUT,
   SSH_READ_MAX_TIMEOUT_MS,
   SSH_READ_TIMEOUT_MS,
+  buildCatArgv,
+  buildListArgv,
   buildLogsArgv,
+  buildStatArgv,
   normalizeLogLines,
   normalizeLogPattern,
   parseReadCommand,
@@ -76,7 +80,7 @@ export function createSshTools(assets: AssetStore, credentials: CredentialStore)
     {
       name: 'ssh.read',
       description:
-        '在资产上执行白名单内的只读诊断命令（负载、内存、磁盘、进程、网络、systemd、journalctl），自动执行并审计。白名单外的命令必须用 ssh.exec 走审批。',
+        '在资产上执行白名单内的只读诊断命令（负载、内存、磁盘、进程、网络、systemd、journalctl、docker version），自动执行并审计。白名单是固定模板，被拒绝后不要换写法重试，直接改用 ssh.exec 提交原命令走审批。',
       risk: 'read',
       parameters: {
         type: 'object',
@@ -85,7 +89,7 @@ export function createSshTools(assets: AssetStore, credentials: CredentialStore)
           command: {
             type: 'string',
             description:
-              '白名单内的完整命令，例如 uptime、free -m、df -h、ps aux、ss -lntp、systemctl status <unit> --no-pager、journalctl -p err -n 100 --no-pager',
+              '白名单内的完整命令，例如 uptime、free -m、df -h、ps aux、ss -lntp、docker version、systemctl status <unit> --no-pager、journalctl -p err -n 100 --no-pager',
           },
           timeoutMs: { type: 'integer', description: '连接和执行超时，1000-30000 毫秒，默认 15000' },
         },
@@ -106,7 +110,7 @@ export function createSshTools(assets: AssetStore, credentials: CredentialStore)
     {
       name: 'ssh.logs',
       description:
-        '读取资产上已授权的日志文件：默认 tail 最近 N 行，可用 grep 做固定字符串匹配。路径必须在资产配置的 SSH 只读路径内，只读，自动执行并审计。',
+        '读取资产上已授权的日志文件：默认 tail 最近 N 行，可用 grep 做固定字符串匹配。路径必须在资产配置的 sshReadPaths 内，只读，自动执行并审计。整文件读取小文件用 ssh.cat，列目录用 ssh.ls。',
       risk: 'read',
       parameters: {
         type: 'object',
@@ -154,6 +158,105 @@ export function createSshTools(assets: AssetStore, credentials: CredentialStore)
           const argv = buildLogsArgv(realPath, lines, pattern)
           const result = await runCommand(opened, chain, argv.join(' '), remaining(), ctx.signal, SSH_READ_MAX_OUTPUT)
           return { ...result, path: realPath, lines, ...(pattern ? { grep: pattern } : {}) }
+        } finally {
+          opened.close()
+        }
+      },
+    },
+    {
+      name: 'ssh.ls',
+      description:
+        '列出资产上已授权目录的内容（一层，含隐藏项）。路径必须在资产配置的 sshReadPaths 内，只读，自动执行并审计。看日志内容用 ssh.logs，整文件读取小文件用 ssh.cat。',
+      risk: 'read',
+      parameters: {
+        type: 'object',
+        properties: {
+          asset: { type: 'string', description: '资产名称' },
+          path: { type: 'string', description: '目录绝对路径，必须在资产配置的 sshReadPaths 内' },
+          timeoutMs: { type: 'integer', description: '连接和执行超时，1000-30000 毫秒，默认 15000' },
+        },
+        required: ['asset', 'path'],
+      },
+      async validate(args) {
+        const chain = await resolveChain(assets, credentials, args.asset)
+        validateLogPath(args.path, chain[chain.length - 1].asset.sshReadPaths ?? [])
+        readTimeoutOf(args.timeoutMs)
+      },
+      async execute(args, ctx) {
+        const chain = await resolveChain(assets, credentials, args.asset)
+        const roots = chain[chain.length - 1].asset.sshReadPaths ?? []
+        const requested = validateLogPath(args.path, roots)
+        const timeout = readTimeoutOf(args.timeoutMs)
+        const deadline = Date.now() + timeout
+        const remaining = (): number => {
+          const left = deadline - Date.now()
+          if (left <= 0) throw new Error('SSH 目录读取超时')
+          return left
+        }
+        const opened = await openChain(chain, timeout, ctx.signal)
+        try {
+          const linked = await runCommand(opened, chain, `readlink -f -- ${requested}`, remaining(), ctx.signal, SSH_READ_MAX_OUTPUT)
+          const realPath = validateRealPath(String(linked.stdout ?? ''), roots)
+          const stat = await runCommand(opened, chain, buildStatArgv(realPath).join(' '), remaining(), ctx.signal, SSH_READ_MAX_OUTPUT)
+          const kind = String(stat.stdout ?? '').trim()
+          if (!kind.startsWith('directory')) {
+            throw new Error(`ssh.ls 只能列目录，实际类型：${kind || '未知'}`)
+          }
+          const result = await runCommand(opened, chain, buildListArgv(realPath).join(' '), remaining(), ctx.signal, SSH_READ_MAX_OUTPUT)
+          return { ...result, path: realPath }
+        } finally {
+          opened.close()
+        }
+      },
+    },
+    {
+      name: 'ssh.cat',
+      description:
+        '读取资产上已授权路径内的普通文件全文（上限 64000 字节）。路径必须在资产配置的 sshReadPaths 内，只读，自动执行并审计。读日志尾部用 ssh.logs，列目录用 ssh.ls。',
+      risk: 'read',
+      parameters: {
+        type: 'object',
+        properties: {
+          asset: { type: 'string', description: '资产名称' },
+          path: { type: 'string', description: '文件绝对路径，必须在资产配置的 sshReadPaths 内' },
+          timeoutMs: { type: 'integer', description: '连接和执行超时，1000-30000 毫秒，默认 15000' },
+        },
+        required: ['asset', 'path'],
+      },
+      async validate(args) {
+        const chain = await resolveChain(assets, credentials, args.asset)
+        validateLogPath(args.path, chain[chain.length - 1].asset.sshReadPaths ?? [])
+        readTimeoutOf(args.timeoutMs)
+      },
+      async execute(args, ctx) {
+        const chain = await resolveChain(assets, credentials, args.asset)
+        const roots = chain[chain.length - 1].asset.sshReadPaths ?? []
+        const requested = validateLogPath(args.path, roots)
+        const timeout = readTimeoutOf(args.timeoutMs)
+        const deadline = Date.now() + timeout
+        const remaining = (): number => {
+          const left = deadline - Date.now()
+          if (left <= 0) throw new Error('SSH 文件读取超时')
+          return left
+        }
+        const opened = await openChain(chain, timeout, ctx.signal)
+        try {
+          const linked = await runCommand(opened, chain, `readlink -f -- ${requested}`, remaining(), ctx.signal, SSH_READ_MAX_OUTPUT)
+          const realPath = validateRealPath(String(linked.stdout ?? ''), roots)
+          const stat = await runCommand(opened, chain, buildStatArgv(realPath).join(' '), remaining(), ctx.signal, SSH_READ_MAX_OUTPUT)
+          const kindText = String(stat.stdout ?? '').trim()
+          const match = /^(.*)\s+(\d+)$/.exec(kindText)
+          const kind = match ? match[1] : kindText
+          const size = match ? Number(match[2]) : NaN
+          if (kind !== 'regular file' && kind !== 'regular empty file') {
+            throw new Error(`ssh.cat 只能读取普通文件，实际类型：${kind || '未知'}`)
+          }
+          if (!Number.isFinite(size)) throw new Error('无法获取文件大小，已拒绝读取')
+          if (size > SSH_CAT_MAX_BYTES) {
+            throw new Error(`文件 ${size} 字节，超过 ssh.cat 上限 ${SSH_CAT_MAX_BYTES} 字节；大文件请用 ssh.logs 按行读取`)
+          }
+          const result = await runCommand(opened, chain, buildCatArgv(realPath).join(' '), remaining(), ctx.signal, SSH_READ_MAX_OUTPUT)
+          return { ...result, path: realPath, bytes: size }
         } finally {
           opened.close()
         }

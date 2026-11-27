@@ -8,6 +8,8 @@ export const SSH_READ_MAX_TIMEOUT_MS = 30_000
 export const SSH_READ_MAX_OUTPUT = 64_000
 export const SSH_LOGS_MAX_LINES = 500
 export const SSH_READ_MAX_PATHS = 20
+/** ssh.cat 单文件上限，和只读通道输出上限一致；更大的文件走 ssh.logs。 */
+export const SSH_CAT_MAX_BYTES = 64_000
 
 /** 命令 token 和日志路径共用同一套安全字符，杜绝管道、重定向、引号、通配符和命令替换。 */
 const SAFE_TOKEN = /^[A-Za-z0-9@%+=:_,.\/-]+$/
@@ -17,7 +19,7 @@ const SAFE_TOKEN = /^[A-Za-z0-9@%+=:_,.\/-]+$/
  */
 const UNIT = /^[A-Za-z0-9@_.][A-Za-z0-9@:_.-]{0,127}(\.(service|socket|timer|mount|target|slice|path|device))?$/
 
-/** 精确匹配的只读命令。只收系统层诊断，不碰文件（文件走 ssh.logs）。 */
+/** 精确匹配的只读命令。只收系统层诊断，不碰文件（文件走 ssh.logs / ssh.cat / ssh.ls）。 */
 const EXACT = new Set([
   // 身份与系统
   'hostnamectl',
@@ -62,6 +64,8 @@ const EXACT = new Set([
   // systemd 与内核
   'systemctl --failed --no-pager',
   'dmesg -T --level=err,warn',
+  // 容器运行时：只暴露版本，不碰容器、镜像和配置
+  'docker version',
   // 只读的固定系统文件
   'cat /etc/os-release',
   'cat /etc/hostname',
@@ -80,10 +84,12 @@ export function parseReadCommand(input: unknown): string[] {
   if (typeof input !== 'string') throw new Error('参数 command 必填')
   const text = input.trim()
   if (!text) throw new Error('参数 command 必填')
-  if (text.length > 300) throw new Error('命令过长，只支持白名单里的短命令')
+  if (text.length > 300) throw new Error('命令过长，只支持白名单里的短命令；需要组合命令请改用 ssh.exec（需审批）')
   const tokens = text.split(/\s+/)
   if (!tokens.every((token) => SAFE_TOKEN.test(token))) {
-    throw new Error('命令含有不允许的字符：只支持白名单命令和普通参数，不能使用管道、重定向、引号、通配符或命令替换')
+    throw new Error(
+      '命令含有不允许的字符：只支持白名单命令和普通参数，不能使用管道、重定向、引号、通配符或命令替换；换写法重试不会通过，需要组合命令请改用 ssh.exec（需审批）',
+    )
   }
   if (EXACT.has(text)) return tokens
   if (tokens.length === 4 && tokens[0] === 'systemctl' && tokens[1] === 'status' && tokens[3] === '--no-pager' && UNIT.test(tokens[2])) {
@@ -100,8 +106,16 @@ export function parseReadCommand(input: unknown): string[] {
   if (tokens[0] === 'journalctl') {
     const lines = journalLines(tokens)
     if (lines !== undefined) return tokens
+    throw new Error(
+      `journalctl 只支持固定模板：-p err|warning -n N --no-pager、-u <unit> -n N --no-pager、-k -n N --no-pager（N 为 1-500）；其它形态请改用 ssh.exec（需审批）`,
+    )
   }
-  throw new Error(`命令不在只读白名单内：${text}`)
+  if (tokens.length === 3 && tokens[0] === 'systemctl' && tokens[1] === 'status' && UNIT.test(tokens[2])) {
+    throw new Error('systemctl status 只支持固定格式：systemctl status <unit> --no-pager；其它形态请改用 ssh.exec（需审批）')
+  }
+  throw new Error(
+    `命令不在只读白名单内：${text}。ssh.read 只支持固定只读模板，换写法重试不会通过；需要执行请改用 ssh.exec（需审批）`,
+  )
 }
 
 /** journalctl 只接受三种固定形态，且 -n 必须在 1..500。 */
@@ -165,7 +179,7 @@ export function pathAllowed(value: string, roots: string[]): boolean {
 /** `ssh.logs` 的请求路径：先按资产允许列表校验，再返回规范化路径。 */
 export function validateLogPath(value: unknown, roots: string[]): string {
   const requested = normalizeReadPath(value)
-  if (!roots.length) throw new Error('该资产没有配置 SSH 只读日志路径，读取文件请使用 ssh.exec 走审批')
+  if (!roots.length) throw new Error('该资产没有配置 SSH 只读路径，读取文件或列目录请使用 ssh.exec 走审批')
   if (!pathAllowed(requested, roots)) {
     throw new Error(`路径不在资产允许的只读范围内：${requested}`)
   }
@@ -179,7 +193,7 @@ export function validateRealPath(value: string, roots: string[]): string {
     throw new Error('远端路径解析结果不合法，已拒绝读取')
   }
   if (!pathAllowed(text, roots)) {
-    throw new Error(`日志软链指向允许范围之外，已拒绝读取：${text}`)
+    throw new Error(`软链指向允许范围之外，已拒绝读取：${text}`)
   }
   return text
 }
@@ -211,4 +225,19 @@ export function buildLogsArgv(pathValue: string, lines: number, pattern?: string
   return pattern
     ? ['grep', '-F', '-m', String(lines), '--', pattern, pathValue]
     : ['tail', '-n', String(lines), '--', pathValue]
+}
+
+/** `ssh.ls` 只列一层（含隐藏项，不含 . 和 ..），路径已在远端解析并校验。 */
+export function buildListArgv(pathValue: string): string[] {
+  return ['ls', '-lA', '--', pathValue]
+}
+
+/** `ssh.cat` 整文件读取；调用前必须确认是普通文件且不超过 SSH_CAT_MAX_BYTES。 */
+export function buildCatArgv(pathValue: string): string[] {
+  return ['cat', '--', pathValue]
+}
+
+/** `ssh.cat` / `ssh.ls` 用 stat 同时拿类型和字节数。 */
+export function buildStatArgv(pathValue: string): string[] {
+  return ['stat', '-L', '-c', '%F %s', '--', pathValue]
 }
